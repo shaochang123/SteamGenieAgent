@@ -1,0 +1,30 @@
+{
+  "name": "steam-genie-mcp",
+  "version": "1.0.0",
+  "description": "Steam MCP Server — AI-powered Steam game manager with deep local integration, market intelligence, and social features",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "steam-genie-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["steam", "mcp", "model-context-protocol", "game", "claude"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
