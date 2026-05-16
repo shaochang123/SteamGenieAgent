@@ -1,0 +1,11 @@
+model_name = 'qwen3:8b'
+embedding_model_name = 'qwen3-embedding:4b'
+history_path = './ChatHistory'
+vector_path = 'ChatDB'
+knowledge_path = './Knowledge'
+md5_path = './md5.txt'
+chunk_size = 1000
+chunk_overlap = 100
+separators = ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]
+max_split_char_number = 1000        # 文本分割的阈值
+user = 'test'

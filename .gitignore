@@ -5,3 +5,10 @@ dist/
 .env.local
 .mcp.json
 .claude
+__pycache__
+.vscode
+*.tar
+*.zip
+*.bin
+*.sqlite3
+test
