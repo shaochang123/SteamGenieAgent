@@ -1,7 +1,6 @@
 <template>
   <div id="app">
-    <img alt="Vue logo" src="./assets/logo.png">
-    <HelloWorld msg="Welcome to Your Vue.js App"/>
+    
     <div class="App">
       <div class="box" @click="fn"></div>
     </div>
@@ -11,13 +10,11 @@
 
 <script>
 
-import HelloWorld from './components/HelloWorld.vue'
 import ChatAgent from './components/ChatAgent.vue'
 
 export default {
   name: 'App',
   components: {
-    HelloWorld,
     ChatAgent
   },
   created(){
@@ -26,7 +23,8 @@ export default {
   methods: {
     fn(){
       alert('你好')
-    }
+    },
+    
   },
 }
 </script>

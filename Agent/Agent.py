@@ -37,11 +37,11 @@ class Agent(BaseChatMessageHistory):
             persist_directory=vector_path
         )
         self.spliter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,       # 分割后的文本段最大长度
-            chunk_overlap=chunk_overlap,     # 连续文本段之间的字符重叠数量
-            separators=separators,       # 自然段落划分的符号
-            length_function=len,                # 使用Python自带的len函数做长度统计的依据
-        )     # 文本分割器的对象
+            chunk_size=chunk_size,      
+            chunk_overlap=chunk_overlap,    
+            separators=separators,       
+            length_function=len,               
+        )    
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
 
     def print_prompt(self, prompt):
@@ -50,11 +50,11 @@ class Agent(BaseChatMessageHistory):
         return prompt
 
     def add_messages(self, messages: Sequence[BaseMessage]) -> None:
-        # Sequence序列 类似list、tuple
+       
         all_messages = list(self.messages)      
         all_messages.extend(messages)          
         new_messages = [message_to_dict(message) for message in all_messages]
-        # 将数据写入文件
+      
         with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump(new_messages, f, ensure_ascii=False)
     
@@ -66,23 +66,23 @@ class Agent(BaseChatMessageHistory):
             str_bytes = input_str.encode(encoding=encoding)
 
             # 创建md5对象
-            md5_obj = hashlib.md5()     # 得到md5对象
-            md5_obj.update(str_bytes)   # 更新内容（传入即将要转换的字节数组）
-            md5_hex = md5_obj.hexdigest()       # 得到md5的十六进制字符串
+            md5_obj = hashlib.md5()     
+            md5_obj.update(str_bytes)  
+            md5_hex = md5_obj.hexdigest()      
             with open(md5_path, 'r', encoding='utf-8') as f:
                 for line in f.readlines():
-                    line = line.strip()     # 处理字符串前后的空格和回车
+                    line = line.strip()    
                     if line == md5_hex:
-                        return True         # 已处理过
+                        return True        
             return False
         
     def update_md5(self, input_str :str, encoding='utf-8'):
         str_bytes = input_str.encode(encoding=encoding)
 
         # 创建md5对象
-        md5_obj = hashlib.md5()     # 得到md5对象
-        md5_obj.update(str_bytes)   # 更新内容（传入即将要转换的字节数组）
-        md5_hex = md5_obj.hexdigest()       # 得到md5的十六进制字符串
+        md5_obj = hashlib.md5()     
+        md5_obj.update(str_bytes)  
+        md5_hex = md5_obj.hexdigest()       
         with open(md5_path, 'a', encoding="utf-8") as f:
             f.write(md5_hex + '\n')
     
@@ -132,19 +132,20 @@ class Agent(BaseChatMessageHistory):
         ]
     )
 
-    def Call(self, question: str, k=3):
-        retriever = self.vector_store.as_retriever(search_kwargs={"k": k}) # RAG检索器
+    def Call(self, question: str, k=3, verbose=False):
+        retriever = self.vector_store.as_retriever(search_kwargs={"k": k}) 
         chain = (
             {"input":RunnablePassthrough(), "context": retriever | self.format_func, "history": lambda _ : self.messages[-10:]} |
             self.prompt |
-            self.print_prompt |
+            # self.print_prompt |
             self.model |
             self.str_parser
         )
         res = chain.stream(question)
         response = ""
         for chunk in res:
-            print(chunk, end="", flush=True)
+            if verbose:
+                print(chunk, end="", flush=True)
             response += chunk
         
         self.add_messages([
@@ -173,8 +174,8 @@ if __name__ == '__main__':
     #             res = SteamAgent.addKnowledge(text, file_name)
     #             print(res)
     #     except Exception as e:
-    #         print(f"读取 {file_name} 时出错: {e}")
+    #         print(f"Read {file_name} error, {e}")
 
-    #  "how about the \"outer wilds\""
+    #  python Agent.py "how about the \"outer wilds\""
     input_question =  sys.argv[1]
     SteamAgent.Call(input_question)
