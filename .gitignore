@@ -3,8 +3,10 @@ dist/
 *.tsbuildinfo
 .env
 .env.local
+.env.*
 .mcp.json
 .claude
+.codex/
 __pycache__
 .vscode
 *.tar
@@ -12,3 +14,8 @@ __pycache__
 *.bin
 *.sqlite3
 test
+frontend/.env*
+Agent/runtime/
+Agent/ChatHisTory/
+Agent/ChatDB/
+Agent/md5.txt

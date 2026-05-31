@@ -1,314 +1,252 @@
-# 🧞‍♂️ Steam-Genie-MCP
+# SteamGenieMcp
 
-> **Turn AI into your ultimate Steam gaming assistant.**
-> Built on the Model Context Protocol (MCP), connecting your AI assistants (Claude Desktop, Cursor, Windsurf) directly with the Steam ecosystem.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![MCP Version: 1.0](https://img.shields.io/badge/MCP-Protocol--v1.0-blue)](https://modelcontextprotocol.io)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
+Local Steam AI workspace with a Vue 2 dashboard, a FastAPI backend, per-user memory, and Steam profile/store cards.
 
 **English** | [中文说明](./README_CN.md)
 
----
+## What this repo is now
 
-# 🌟 Why Steam-Genie-MCP?
+The active application in this repository is:
 
-**Steam-Genie-MCP** offers the following features:
+- `Agent/`: Python backend for chat, profile storage, Steam data, and retrieval
+- `frontend/`: Vue 2 single-page UI with an iOS-style layout
 
-* **Offline-first**: A built-in VDF parser reads local Steam files directly, enabling instant access to installed games and screenshots without internet access.
-* **Region-focused**: Deep optimization for the Chinese Steam region (CNY), with support for 40+ currencies.
-* **End-to-end workflow**: From game recommendations → inventory valuation → market comparison → one-click launching.
+This repo also still contains an earlier TypeScript MCP prototype under `src/` and `dist/`. It is kept in the repository, but it is not the main surface used by the current local dashboard.
 
-**Tech Stack**: TypeScript + [MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk) + Zod validation + custom-built VDF parsing engine. Native support for Claude Code, Claude Desktop, Cursor, and Windsurf.
+## Features
 
-## 🛠️ Core Features
+- Multi-user local profiles
+  - Create, switch, and delete users by display name
+  - Each user gets isolated chat history and isolated credentials
+- AI chat with per-user provider selection
+  - Choose exactly one provider per user: local `Ollama` or an `OpenAI-compatible` API
+  - Recent conversation history is preserved when switching users
+- External memory management
+  - User profiles, message history, vector data, and logs live under `Agent/runtime/`
+  - Runtime data is ignored by Git by default
+- Steam data cards
+  - Steam overview card: avatar, persona name, online status, current game, owned game stats, recent games
+  - Steam store deals card: featured discounts for the configured region and language
+  - If `SteamID64` is present but the Steam Web API key is missing or invalid, the app falls back to public profile data instead of failing completely
+- Retrieval-augmented answers
+  - Local knowledge files under `Agent/Knowledge/` can be indexed into Chroma
+  - If retrieval is unavailable, chat degrades to history-only responses instead of crashing
 
-| Feature                       | Description                            | Example Use Case                                                                                          |
-| ----------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| **🕹️ Smart Game Control**    | Intelligent game recommendation engine | “I have 2 free hours this afternoon. Pick the highest-rated unfinished game in my library and launch it.” |
-| **💰 Inventory Expert**       | CS2 / Dota2 inventory valuation        | “How much is my CS2 inventory worth? Which items increased in value?”                                     |
-| **📈 Market Intelligence**    | Steam CN-region price monitoring       | “Track the historical lowest price of Black Myth: Wukong.”                                                |
-| **📂 Deep Local Integration** | Offline VDF parser                     | “List all my installed games and screenshots without connecting online.”                                  |
-| **🤝 Social Assistant**       | Friend management + invite generation  | “See who’s online, find a co-op game everyone owns, and generate an invite message.”                      |
+## Stack
 
----
+- Backend: Python, FastAPI, Uvicorn
+- Retrieval: LangChain, Chroma, Ollama embeddings
+- Frontend: Vue 2, Vue CLI, Axios, Less
+- Data fetch: Python stdlib `urllib`
 
-# 🚀 Quick Start
-
-## Prerequisites
-
-* Install [Node.js](https://nodejs.org/) (v18+)
-* (Optional) A [Steam Web API Key](https://steamcommunity.com/dev/apikey) — required for online features such as library sync, friends, and achievements
-* Local VDF parsing works **without an API key**
-
-## 1. Install & Run
-
-```bash
-npx steam-genie-mcp --api-key YOUR_STEAM_KEY --steam-id YOUR_STEAM_ID --steam-path "D:\\steam"
-```
-
-| Parameter      | Required    | Description                                                                             |
-| -------------- | ----------- | --------------------------------------------------------------------------------------- |
-| `--api-key`    | Recommended | Steam Web API Key. Without it, only online features are disabled                        |
-| `--steam-id`   | Recommended | SteamID64. Without it, inventory/friend features are unavailable                        |
-| `--steam-path` | No          | Steam installation directory. **Auto-detected if omitted** (Windows/macOS/Linux)        |
-| `--currency`   | No          | Currency for market/store prices. Default: CNY. Supports USD/EUR/JPY and 40+ currencies |
-
-The `currency` parameter controls:
-
-* The display currency for **market lowest prices** of inventory items
-* Store **price queries** (`check_price`, `monitor_price`, `get_deals`)
-* Currency units returned by Steam Market APIs (`USD` → `$`, `CNY` → `¥`)
-
----
-
-## 2. Configure Your AI Assistant
-
-### Claude Code (`.mcp.json` in project root)
-
-```json
-{
-  "mcpServers": {
-    "steam-genie": {
-      "command": "npx",
-      "args": [
-        "steam-genie-mcp",
-        "--api-key", "YOUR_STEAM_API_KEY",
-        "--steam-id", "YOUR_64BIT_STEAM_ID",
-        "--currency", "CNY"
-      ]
-    }
-  }
-}
-```
-
-Claude Code automatically loads `.mcp.json` from the project root.
-You can also place it in the global path `~/.claude/.mcp.json` to share across projects.
-
-After launching Claude Code, run `/mcp` to check connection status.
-
----
-
-### Claude Desktop (`claude_desktop_config.json`)
-
-```json
-{
-  "mcpServers": {
-    "steam-genie": {
-      "command": "npx",
-      "args": [
-        "steam-genie-mcp",
-        "--api-key", "YOUR_STEAM_API_KEY",
-        "--steam-id", "YOUR_64BIT_STEAM_ID",
-        "--currency", "CNY"
-      ]
-    }
-  }
-}
-```
-
----
-
-### Cursor / Windsurf (`.cursor/mcp.json`)
-
-```json
-{
-  "mcpServers": {
-    "steam-genie": {
-      "command": "npx",
-      "args": [
-        "steam-genie-mcp",
-        "--api-key", "YOUR_STEAM_API_KEY",
-        "--steam-id", "YOUR_64BIT_STEAM_ID",
-        "--currency", "CNY"
-      ]
-    }
-  }
-}
-```
-
----
-
-## 3. Environment Variables (Optional)
-
-You may also configure everything using environment variables instead of CLI arguments:
-
-| Variable         | Description             | Default           |
-| ---------------- | ----------------------- | ----------------- |
-| `STEAM_API_KEY`  | Steam Web API key       | —                 |
-| `STEAM_ID`       | SteamID64               | —                 |
-| `STEAM_PATH`     | Steam installation path | **Auto-detected** |
-| `STEAM_CURRENCY` | Market/store currency   | CNY               |
-
----
-
-# 🧰 MCP Tool List
-
-## 🕹️ Game Library Management
-
-| Tool                    | Description                                                          |
-| ----------------------- | -------------------------------------------------------------------- |
-| `list_games`            | List library games with sorting by install status, playtime, or name |
-| `find_game_for_session` | Recommend the best game based on available playtime                  |
-| `launch_game`           | Launch a game via AppID (`steam://` protocol)                        |
-| `get_game_details`      | Fetch game details: price, reviews, platforms, genres                |
-| `get_achievements`      | View achievement progress, including recent unlocks                  |
-
----
-
-## 💰 Inventory Management
-
-| Tool                    | Description                                                |
-| ----------------------- | ---------------------------------------------------------- |
-| `get_inventory`         | Retrieve CS2 / Dota2 inventory with live market prices     |
-| `get_item_price`        | Query Steam Market prices for a specific item              |
-| `get_inventory_summary` | Inventory overview: total value, top items, tradable stats |
-
----
-
-## 📈 Market Intelligence
-
-| Tool            | Description                                           |
-| --------------- | ----------------------------------------------------- |
-| `search_store`  | Search the Steam Store                                |
-| `get_deals`     | Get active discounts and promotions with filtering    |
-| `monitor_price` | Compare current price with historical price data      |
-| `check_price`   | Batch query Steam CN-region prices for multiple games |
-
----
-
-## 📂 Local Integration (No API Key Required)
-
-| Tool                   | Description                                             |
-| ---------------------- | ------------------------------------------------------- |
-| `list_installed_games` | Scan local VDF files for installed games and disk usage |
-| `list_library_folders` | List all Steam library folder locations                 |
-| `get_screenshots`      | Retrieve local screenshots by game or globally          |
-| `list_shortcuts`       | List added non-Steam shortcuts                          |
-
----
-
-## 🤝 Social Features
-
-| Tool                 | Description                                                      |
-| -------------------- | ---------------------------------------------------------------- |
-| `get_friend_list`    | View friends and their online/game status                        |
-| `find_shared_games`  | Find games shared with a friend                                  |
-| `find_coop_game`     | Recommend multiplayer co-op games from your library              |
-| `generate_invite`    | Generate humorous invite messages (4 styles / bilingual support) |
-| `get_friend_summary` | Friend online status summary                                     |
-
----
-
-# 📂 Project Structure
+## Project layout
 
 ```text
-steam-genie-mcp/
-├── src/
-│   ├── index.ts              # MCP Server entry & tool registration
-│   ├── types.ts              # TypeScript type definitions
-│   ├── steam/
-│   │   ├── api.ts            # Steam Web API wrapper
-│   │   ├── market.ts         # Steam Market / pricing services
-│   │   ├── vdf.ts            # VDF file parser
-│   │   └── launcher.ts       # Game launcher (steam://)
-│   └── tools/
-│       ├── library.ts        # Game library tools
-│       ├── inventory.ts      # Inventory / asset tools
-│       ├── market.ts         # Market intelligence tools
-│       ├── local.ts          # Local VDF tools
-│       └── social.ts         # Social feature tools
-├── package.json
-├── tsconfig.json
-├── LICENSE
-├── README.md          # English documentation
-└── README_CN.md       # Chinese documentation
+SteamGenieMcp/
+├── Agent/
+│   ├── Agent.py                 # chat orchestration and provider routing
+│   ├── server.py                # FastAPI app
+│   ├── profile_store.py         # per-user profile and history persistence
+│   ├── steam_service.py         # Steam profile and store data
+│   ├── http_utils.py            # small HTTP helpers
+│   ├── build_vector_db.py       # optional knowledge indexing
+│   ├── Knowledge/               # optional local knowledge JSON files
+│   └── runtime/                 # local-only runtime data, ignored by Git
+├── frontend/
+│   ├── src/App.vue
+│   ├── src/components/
+│   ├── src/api/api.js
+│   └── src/store/appStore.js
+├── src/                         # legacy TypeScript MCP prototype
+├── README.md
+└── README_CN.md
 ```
 
----
+## Runtime data and Git safety
 
-# 🔒 Security Design
+Local data is intentionally written outside tracked source files:
 
-Steam-Genie-MCP is a **locally running** MCP server. Your data never leaves your machine.
+- `Agent/runtime/profiles/*.json`: per-user settings
+- `Agent/runtime/histories/*.json`: per-user chat history
+- `Agent/runtime/vector/`: Chroma persistence
+- `Agent/runtime/logs/`: local dev logs
+- `Agent/runtime/md5.txt`: dedupe state for knowledge indexing
 
-| Security Feature            | Description                                                                                                                                                              |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **API Key Never Exposed**   | `STEAM_API_KEY` is only read from `.mcp.json` or environment variables and communicates directly with `api.steampowered.com` over stdio. No third-party servers involved |
-| **No Telemetry / Tracking** | Zero analytics, zero tracking, zero reporting. The entire project contains only 11 source files and is fully auditable                                                   |
-| **Local Read-Only Access**  | VDF parsing only reads configuration files in the Steam installation directory. No file modifications are performed                                                      |
-| **Zod Input Validation**    | All 19 MCP tools use strict Zod schemas to prevent injection attacks                                                                                                     |
-| **stdio Isolation**         | MCP communication uses standard input/output only. No exposed HTTP ports or network listeners                                                                            |
-| **Config Files Ignored**    | `.mcp.json` and `.env` are already added to `.gitignore` to avoid accidental API key commits                                                                             |
-| **Sanitized Logs**          | Startup logs only display `✓ configured` instead of printing API keys in plaintext                                                                                       |
+Ignored paths include:
 
-> You can audit the full source code in the [`src/`](src/) directory.
+- `Agent/runtime/`
+- `Agent/ChatHisTory/`
+- `Agent/ChatDB/`
+- `frontend/.env*`
+- `.mcp.json`
+- `.codex/`
 
----
+That keeps API keys, Steam identifiers, histories, and local caches out of commits by default.
 
-# 📋 FAQ
+## Quick start
 
-<details>
-<summary><b>Q: Can I use this without a Steam API Key?</b></summary>
+### 1. Backend requirements
 
-Yes. Local features such as `list_installed_games`, `get_screenshots`, and `list_library_folders` work without an API key. Only online features (friends, store, market) require one.
+Recommended:
 
-</details>
+- Python 3.10+
+- [Ollama](https://ollama.com/) if you want to use the default local provider or build local embeddings
 
-<details>
-<summary><b>Q: How do I get a Steam Web API Key?</b></summary>
+Install backend dependencies in your own environment:
 
-Visit [https://steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey), log into your Steam account, and enter a domain name such as `localhost`.
+```bash
+pip install fastapi uvicorn langchain-chroma langchain-core langchain-ollama langchain-text-splitters
+```
 
-</details>
+If you plan to use the default local models, pull them first:
 
-<details>
-<summary><b>Q: How do I find my SteamID64?</b></summary>
+```bash
+ollama pull qwen3:8b
+ollama pull qwen3-embedding:4b
+```
 
-Open the Steam client and check the numeric ID in **Profile → Page URL**.
-You can also use an online converter tool for custom profile URLs.
+### 2. Frontend requirements
 
-</details>
+- Node.js 18+
 
-<details>
-<summary><b>Q: Why is my inventory query empty?</b></summary>
+Install frontend dependencies:
 
-1. Make sure your Steam profile inventory privacy is set to **Public**
-2. Verify that your SteamID64 is correct
-3. CS2 inventory uses `context_id: 2`, and Dota2 also uses `2`
+```bash
+cd frontend
+npm install
+```
 
-</details>
+### 3. Start the backend
 
----
+From the repository root:
 
-# 🤝 Contributing
+```bash
+python Agent/server.py
+```
 
-Issues, PRs, and feature suggestions are welcome!
+The API listens on:
 
-Before submitting a PR, please ensure:
+```text
+http://127.0.0.1:8000
+```
 
-* [ ] `npm run typecheck` passes
-* [ ] `npm run build` succeeds
-* [ ] New tools include clear `zod` schema definitions
+### 4. Start the frontend
 
----
+In a second terminal:
 
-# 🗺️ Roadmap
+```bash
+cd frontend
+npm run serve
+```
 
-* [ ] Wishlist monitoring & price drop notifications
-* [ ] Playtime estimation integration (HowLongToBeat)
-* [ ] Multi-account inventory aggregation
-* [ ] Automatic Steam review translation
-* [ ] Remote launch support (Tailscale / Wake-on-LAN)
-* [ ] Cloud sync recommendations for game configs
+The UI runs on:
 
----
+```text
+http://127.0.0.1:8080
+```
 
-# 📄 License
+### 5. Open the app
 
-MIT License — see [LICENSE](./LICENSE)
+1. Create a local user
+2. Open `Settings`
+3. Pick exactly one AI provider
+4. Optionally add `Steam API Key` and `SteamID64`
+5. Start chatting
 
----
+## Configuration model
 
-<p align="center">
-  <sub>Made with ❤️ for Steam gamers and AI enthusiasts</sub>
-</p>
+Each user profile stores two sections:
+
+### AI
+
+- `provider`
+  - `ollama`
+  - `openai-compatible`
+- `ollama.baseUrl`
+- `ollama.model`
+- `openaiCompatible.apiKey`
+- `openaiCompatible.baseUrl`
+- `openaiCompatible.model`
+
+### Steam
+
+- `apiKey`
+- `steamId`
+- `country`
+- `language`
+
+Defaults are defined in [Agent/config.py](./Agent/config.py).
+
+## Optional knowledge indexing
+
+If you want retrieval over the local JSON files in `Agent/Knowledge/`:
+
+```bash
+python Agent/build_vector_db.py
+```
+
+Notes:
+
+- The index is written to `Agent/runtime/vector/`
+- Duplicate content is skipped using `Agent/runtime/md5.txt`
+- Retrieval errors do not block chat; the app falls back to direct conversation
+
+## HTTP API
+
+The frontend talks to these backend endpoints:
+
+- `GET /profiles`
+- `POST /profiles`
+- `GET /profiles/{profileId}`
+- `DELETE /profiles/{profileId}`
+- `PATCH /profiles/{profileId}/config`
+- `GET /profiles/{profileId}/messages`
+- `POST /chat`
+- `GET /profiles/{profileId}/steam/overview`
+- `GET /profiles/{profileId}/steam/deals`
+
+## Frontend behavior
+
+The current dashboard is designed around three areas:
+
+- Left: profile list and user management
+- Center: chat history and composer
+- Right: Steam overview and Steam deals
+
+UI details that are already implemented:
+
+- centered settings modal
+- pinned chat composer at the bottom of the chat pane
+- single settings entry in the top-right of the chat pane
+- delete-user action in the sidebar with confirmation
+
+## Development commands
+
+Frontend:
+
+```bash
+cd frontend
+npm run lint
+npm run build
+```
+
+Backend smoke checks:
+
+```bash
+python -m py_compile Agent/Agent.py Agent/server.py Agent/profile_store.py Agent/steam_service.py Agent/http_utils.py
+```
+
+## Known defaults
+
+- default chat provider: `ollama`
+- default Ollama base URL: `http://127.0.0.1:11434`
+- default Ollama model: `qwen3:8b`
+- default OpenAI-compatible base URL: `https://api.openai.com/v1`
+- default OpenAI-compatible model: `gpt-4.1-mini`
+- default Steam country/language: `CN` / `zh-CN`
+
+## Notes
+
+- `SteamID64` alone is enough to show a public-profile fallback
+- A valid Steam Web API key is still required for owned-game counts and recent-play data
+- The current UI is local-first and assumes sensitive data stays on the same machine

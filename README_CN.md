@@ -1,288 +1,252 @@
-# 🧞‍♂️ Steam-Genie-MCP
+# SteamGenieMcp
 
-> **让 AI 成为你的终极 Steam 游戏管家。**
-> 基于 Model Context Protocol (MCP)，连接你的 AI 助手（Claude Desktop, Cursor, Windsurf）与 Steam 生态。
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![MCP Version: 1.0](https://img.shields.io/badge/MCP-Protocol--v1.0-blue)](https://modelcontextprotocol.io)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
+一个本地运行的 Steam AI 工作台，包含 Vue 2 前端界面、FastAPI 后端、按用户隔离的会话记忆，以及 Steam 个人资料和商店卡片。
 
 [English](./README.md) | **中文说明**
 
+## 这个仓库现在是什么
 
----
+当前真正可运行的应用由两部分组成：
 
-## 🌟 为什么选择 Steam-Genie-MCP？
+- `Agent/`：Python 后端，负责聊天、用户档案、Steam 数据和检索
+- `frontend/`：Vue 2 单页前端，提供 iOS 风格的本地控制台界面
 
-**Steam-Genie-MCP** 有以下几个特性：
+仓库里还保留着一套更早的 TypeScript MCP 原型，位于 `src/` 和 `dist/`。它没有被删除，但已经不是当前本地面板的主入口。
 
-- **离线优先**：VDF 解析器直读本地 Steam 文件，不联网也能秒查已安装游戏、截图
-- **区域深耕**：Steam 市场/商店 API 针对国区 (CNY) 深度适配，支持 40+ 货币切换
-- **全链路打通**：从游戏推荐 → 资产估值 → 市场比价 → 一键启动，一条龙闭环
+## 主要功能
 
-**技术栈**：TypeScript + [MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk) + Zod 输入校验 + 自研 VDF 解析引擎。原生支持 Claude Code、Claude Desktop、Cursor、Windsurf。
+- 多用户本地档案
+  - 可创建、切换、删除用户
+  - 每个用户都有独立的聊天记录和独立的凭据配置
+- 按用户选择 AI 接入方式
+  - 每个用户必须二选一：本地 `Ollama` 或 `OpenAI 兼容接口`
+  - 切换用户后会恢复该用户自己的历史会话
+- 外部记忆管理
+  - 用户配置、聊天历史、向量库和日志统一写入 `Agent/runtime/`
+  - 这些运行态数据默认被 Git 忽略
+- Steam 数据卡片
+  - Steam 概览卡：头像、昵称、在线状态、当前游戏、拥有游戏数、最近游戏
+  - Steam 商店卡：按地区和语言获取促销卡片
+  - 如果只填了 `SteamID64`，但 `Steam API Key` 缺失或无效，系统会自动降级为公开资料模式，而不是整块报错
+- 检索增强回答
+  - `Agent/Knowledge/` 下的本地知识文件可以写入 Chroma
+  - 检索不可用时，会自动降级为纯历史对话，不会直接让聊天失败
 
-### 🛠️ 核心功能
+## 技术栈
 
-| 功能 | 说明 | 使用场景 |
-|------|------|---------|
-| **🕹️ 极致控制** | 游戏库智能推荐引擎 | "我下午有 2 小时空档，帮我从库里挑一个好评最高且未通关的游戏并启动。" |
-| **💰 资产专家** | CS2 / Dota2 饰品估值系统 | "查一下我 CS2 库存值多少钱？哪个饰品涨了？" |
-| **📈 市场情报** | Steam 国区特供价格监控 | "监控《黑神话：悟空》的史低价格" |
-| **📂 深度本地化** | 离线 VDF 解析器 | "列出我所有已安装的游戏和截图，无需联网。" |
-| **🤝 社交助手** | 好友管理 + 邀请生成 | "看看现在谁在线，找个大家都能玩的合作游戏，并生成一段邀请语。" |
+- 后端：Python、FastAPI、Uvicorn
+- 检索：LangChain、Chroma、Ollama Embeddings
+- 前端：Vue 2、Vue CLI、Axios、Less
+- HTTP 请求：Python 标准库 `urllib`
 
----
+## 项目结构
 
-## 🚀 快速开始
+```text
+SteamGenieMcp/
+├── Agent/
+│   ├── Agent.py                 # 聊天编排和 provider 路由
+│   ├── server.py                # FastAPI 服务
+│   ├── profile_store.py         # 用户配置和历史消息持久化
+│   ├── steam_service.py         # Steam 概览与商店数据
+│   ├── http_utils.py            # 简单 HTTP 工具
+│   ├── build_vector_db.py       # 可选的知识库索引脚本
+│   ├── Knowledge/               # 本地知识 JSON
+│   └── runtime/                 # 本地运行态数据，默认不进 Git
+├── frontend/
+│   ├── src/App.vue
+│   ├── src/components/
+│   ├── src/api/api.js
+│   └── src/store/appStore.js
+├── src/                         # 旧的 TypeScript MCP 原型
+├── README.md
+└── README_CN.md
+```
 
-### 前提条件
+## 运行态数据与 Git 安全
 
-- 安装了 [Node.js](https://nodejs.org/) (v18+)
-- （可选）拥有一个 [Steam Web API Key](https://steamcommunity.com/dev/apikey) — 用于游戏库、好友、成就等在线功能
-- 本地 VDF 解析功能**无需 API Key**，直接可用
+本地敏感数据不会再写进受版本控制的源码文件，而是统一写到：
 
-### 1. 安装与运行
+- `Agent/runtime/profiles/*.json`：每个用户的设置
+- `Agent/runtime/histories/*.json`：每个用户的聊天历史
+- `Agent/runtime/vector/`：Chroma 向量库
+- `Agent/runtime/logs/`：本地开发日志
+- `Agent/runtime/md5.txt`：知识索引去重状态
+
+当前已忽略的重要路径：
+
+- `Agent/runtime/`
+- `Agent/ChatHisTory/`
+- `Agent/ChatDB/`
+- `frontend/.env*`
+- `.mcp.json`
+- `.codex/`
+
+这样可以默认避免把 API Key、SteamID、聊天记录和本地缓存提交到仓库。
+
+## 快速开始
+
+### 1. 后端环境
+
+建议环境：
+
+- Python 3.10+
+- 如果你要使用默认本地模型或本地 Embedding，需要安装 [Ollama](https://ollama.com/)
+
+在你的 Python 环境中安装依赖：
 
 ```bash
-npx steam-genie-mcp --api-key YOUR_STEAM_KEY --steam-id YOUR_STEAM_ID --steam-path "D:\\steam"
+pip install fastapi uvicorn langchain-chroma langchain-core langchain-ollama langchain-text-splitters
 ```
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `--api-key` | 推荐 | Steam Web API Key，缺失时仅无法使用在线功能 |
-| `--steam-id` | 推荐 | SteamID64，缺失时仅无法使用库存/好友功能 |
-| `--steam-path` | 否 | Steam 安装目录，**不填则自动检测**（Windows/macOS/Linux） |
-| `--currency` | 否 | 市场/商店价格显示的货币，默认 CNY（人民币）。支持 USD/EUR/JPY 等 40+ 种货币 |
+如果你准备使用默认本地模型，先拉取模型：
 
-`currency` 参数控制：
-- 库存物品的**市场最低价**显示货币
-- 游戏商店**价格查询**（`check_price`、`monitor_price`、`get_deals`）的币种
-- Steam 市场 API 返回的货币单位（如 `USD` → `$`、`CNY` → `¥`）
-
-### 2. 配置 AI 助手
-
-**Claude Code**（项目根目录 `.mcp.json`）：
-
-```json
-{
-  "mcpServers": {
-    "steam-genie": {
-      "command": "npx",
-      "args": [
-        "steam-genie-mcp",
-        "--api-key", "YOUR_STEAM_API_KEY",
-        "--steam-id", "YOUR_64BIT_STEAM_ID",
-        "--currency", "CNY"
-      ]
-    }
-  }
-}
+```bash
+ollama pull qwen3:8b
+ollama pull qwen3-embedding:4b
 ```
 
-Claude Code 会自动加载项目根目录的 `.mcp.json`。也可以放入全局 `~/.claude/.mcp.json`，所有项目通用。启动 Claude Code 后输入 `/mcp` 可查看连接状态。
+### 2. 前端环境
 
-**Claude Desktop** (`claude_desktop_config.json`)：
+- Node.js 18+
 
-```json
-{
-  "mcpServers": {
-    "steam-genie": {
-      "command": "npx",
-      "args": [
-        "steam-genie-mcp",
-        "--api-key", "YOUR_STEAM_API_KEY",
-        "--steam-id", "YOUR_64BIT_STEAM_ID",
-        "--currency", "CNY"
-      ]
-    }
-  }
-}
+安装前端依赖：
+
+```bash
+cd frontend
+npm install
 ```
 
-**Cursor / Windsurf** (`.cursor/mcp.json`)：
+### 3. 启动后端
 
-```json
-{
-  "mcpServers": {
-    "steam-genie": {
-      "command": "npx",
-      "args": [
-        "steam-genie-mcp",
-        "--api-key", "YOUR_STEAM_API_KEY",
-        "--steam-id", "YOUR_64BIT_STEAM_ID",
-        "--currency", "CNY"
-      ]
-    }
-  }
-}
+在仓库根目录执行：
+
+```bash
+python Agent/server.py
 ```
 
-### 3. 环境变量配置 (可选)
+后端地址：
 
-除 CLI 参数外，你也可以使用环境变量：
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `STEAM_API_KEY` | Steam Web API 密钥 | — |
-| `STEAM_ID` | SteamID64 | — |
-| `STEAM_PATH` | Steam 安装目录 | **自动检测** |
-| `STEAM_CURRENCY` | 市场/商店价格货币 | CNY |
-
----
-
-## 🧰 MCP 工具列表
-
-### 🕹️ 游戏库管理
-
-| 工具 | 描述 |
-|------|------|
-| `list_games` | 列出游戏库，支持按安装状态、时长、名称排序 |
-| `find_game_for_session` | 根据空闲时长智能推荐最适合的游戏 |
-| `launch_game` | 通过 AppID 启动游戏（调用 `steam://` 协议） |
-| `get_game_details` | 获取游戏详情：价格、评价、平台、类型 |
-| `get_achievements` | 查询成就进度，展示最近解锁和未解锁项 |
-
-### 💰 资产管理
-
-| 工具 | 描述 |
-|------|------|
-| `get_inventory` | 获取 CS2 / Dota2 库存，含市场实时价格 |
-| `get_item_price` | 查询单个物品的 Steam 市场行情 |
-| `get_inventory_summary` | 库存摘要：总估值、Top 物品、可交易统计 |
-
-### 📈 市场情报
-
-| 工具 | 描述 |
-|------|------|
-| `search_store` | 搜索 Steam 商店 |
-| `get_deals` | 获取当前促销折扣列表，支持按折扣筛选 |
-| `monitor_price` | 对比当前价格与历史数据，判断是否史低 |
-| `check_price` | 批量查询多个游戏的中国区价格 |
-
-### 📂 本地集成（无需 API Key）
-
-| 工具 | 描述 |
-|------|------|
-| `list_installed_games` | 扫描本地 VDF 文件，列出已安装游戏及磁盘占用 |
-| `list_library_folders` | 列出所有 Steam 库文件夹位置 |
-| `get_screenshots` | 按游戏或全部列出本地截图 |
-| `list_shortcuts` | 列出添加的非 Steam 快捷方式 |
-
-### 🤝 社交功能
-
-| 工具 | 描述 |
-|------|------|
-| `get_friend_list` | 查看好友列表及在线/游戏状态 |
-| `find_shared_games` | 查找与指定好友的共同游戏 |
-| `find_coop_game` | 从库中筛选支持多人合作的游戏 |
-| `generate_invite` | 生成风趣的游戏邀请语 (4 种风格 / 中英文) |
-| `get_friend_summary` | 好友在线统计摘要 |
-
----
-
-## 📂 项目结构
-
-```
-steam-genie-mcp/
-├── src/
-│   ├── index.ts              # MCP Server 入口，工具注册
-│   ├── types.ts              # TypeScript 类型定义
-│   ├── steam/
-│   │   ├── api.ts            # Steam Web API 封装
-│   │   ├── market.ts         # Steam 市场 / 价格服务
-│   │   ├── vdf.ts            # VDF 文件解析器
-│   │   └── launcher.ts       # 游戏启动器 (steam://)
-│   └── tools/
-│       ├── library.ts        # 游戏库管理工具
-│       ├── inventory.ts      # 库存 / 资产管理工具
-│       ├── market.ts         # 市场情报工具
-│       ├── local.ts          # 本地 VDF 工具
-│       └── social.ts         # 社交功能工具
-├── package.json
-├── tsconfig.json
-├── LICENSE
-├── README.md          # English documentation
-└── README_CN.md       # 中文文档
+```text
+http://127.0.0.1:8000
 ```
 
----
+### 4. 启动前端
 
-## 🔒 安全设计
+另开一个终端：
 
-Steam-Genie-MCP 是**本地运行**的 MCP Server，你的数据从未离开你的机器：
+```bash
+cd frontend
+npm run serve
+```
 
-| 安全特性 | 说明 |
-|----------|------|
-| **API Key 不出境** | `STEAM_API_KEY` 仅从你的 `.mcp.json` 或环境变量读取，通过 stdio 直连 `api.steampowered.com`。不经过任何第三方服务器 |
-| **无遥测无追踪** | 零埋点、零分析、零上报。代码一共 11 个源文件，全部可审计 |
-| **本地只读** | VDF 解析仅读取 Steam 安装目录下的配置文件，不写入、不修改任何本地文件 |
-| **Zod 输入校验** | 全部 19 个 MCP 工具的输入参数均由 Zod schema 严格校验，防止注入 |
-| **stdio 隔离** | MCP 协议通过标准输入/输出通信，无 HTTP 端口暴露，无网络监听 |
-| **配置不入库** | `.mcp.json` 和 `.env` 已加入 `.gitignore`，不会误提交 API Key |
-| **Stderr 脱敏** | 启动日志中 API Key 仅显示 `✓ configured`，不会明文打印 |
+前端地址：
 
-> 你可以在 [`src/`](src/) 目录下审阅全部源码。
+```text
+http://127.0.0.1:8080
+```
 
----
+### 5. 打开应用
 
-## 📋 常见问题
+1. 新建一个本地用户
+2. 打开右上角 `设置`
+3. 在 `Ollama` 和 `OpenAI 兼容接口` 中二选一
+4. 可选填写 `Steam API Key` 和 `SteamID64`
+5. 开始聊天
 
-<details>
-<summary><b>Q: 没有 Steam API Key 怎么用？</b></summary>
+## 配置模型
 
-本地功能（`list_installed_games`、`get_screenshots`、`list_library_folders` 等）不需要 API Key。只有需要联网的功能（好友、商店、市场）才需要 API Key。
-</details>
+每个用户档案包含两部分配置：
 
-<details>
-<summary><b>Q: 如何获取 Steam Web API Key？</b></summary>
+### AI
 
-访问 [https://steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey)，登录你的 Steam 账号，填写一个域名（如 `localhost`）即可获取。
-</details>
+- `provider`
+  - `ollama`
+  - `openai-compatible`
+- `ollama.baseUrl`
+- `ollama.model`
+- `openaiCompatible.apiKey`
+- `openaiCompatible.baseUrl`
+- `openaiCompatible.model`
 
-<details>
-<summary><b>Q: 如何获取我的 SteamID64？</b></summary>
+### Steam
 
-打开 Steam 客户端，点击 **个人资料 → 页面 URL** 中的数字即为 SteamID64。或者使用在线工具转换你的自定义 URL。
-</details>
+- `apiKey`
+- `steamId`
+- `country`
+- `language`
 
-<details>
-<summary><b>Q: 库存查询返回空怎么办？</b></summary>
+默认值定义在 [Agent/config.py](./Agent/config.py)。
 
-1. 确认 Steam 个人资料 → 隐私设置 → 库存设为「公开」
-2. 确认使用的 SteamID64 正确
-3. CS2 库存改用 context_id: 2，Dota2 用 2
-</details>
+## 可选：构建本地知识索引
 
----
+如果你想让聊天对 `Agent/Knowledge/` 下的本地 JSON 做检索增强：
 
-## 🤝 参与贡献
+```bash
+python Agent/build_vector_db.py
+```
 
-欢迎提交 Issue、PR 和功能建议！提交 PR 前请确保：
+说明：
 
-- [ ] `npm run typecheck` 通过
-- [ ] `npm run build` 成功
-- [ ] 新增工具包含清晰的 `zod` schema 描述
+- 索引会写入 `Agent/runtime/vector/`
+- 重复内容会通过 `Agent/runtime/md5.txt` 去重
+- 即使检索失败，也不会阻断聊天，只会降级为普通对话
 
----
+## HTTP API
 
-## 🗺️ 路线图
+前端当前使用的后端接口如下：
 
-- [ ] 愿望单监控与降价通知
-- [ ] 游戏时长预估（对接 HowLongToBeat）
-- [ ] 多账号库存聚合管理
-- [ ] Steam 评测自动翻译
-- [ ] 远程启动（Tailscale/Wake-on-LAN）
-- [ ] 游戏配置云同步建议
+- `GET /profiles`
+- `POST /profiles`
+- `GET /profiles/{profileId}`
+- `DELETE /profiles/{profileId}`
+- `PATCH /profiles/{profileId}/config`
+- `GET /profiles/{profileId}/messages`
+- `POST /chat`
+- `GET /profiles/{profileId}/steam/overview`
+- `GET /profiles/{profileId}/steam/deals`
 
----
+## 前端界面行为
 
-## 📄 许可证
+当前面板分为三块：
 
-MIT License — 详见 [LICENSE](./LICENSE)
+- 左侧：用户列表与用户管理
+- 中间：聊天记录与输入框
+- 右侧：Steam 概览与商店卡片
 
----
+已经实现的交互细节：
 
-<p align="center">
-  <sub>Made with ❤️ for Steam gamers and AI enthusiasts</sub>
-</p>
+- 设置面板居中显示
+- 对话输入框固定在聊天面板底部
+- 设置入口只保留在聊天区右上角
+- 侧边栏提供删除当前用户，并带确认提示
+
+## 开发命令
+
+前端：
+
+```bash
+cd frontend
+npm run lint
+npm run build
+```
+
+后端基础检查：
+
+```bash
+python -m py_compile Agent/Agent.py Agent/server.py Agent/profile_store.py Agent/steam_service.py Agent/http_utils.py
+```
+
+## 当前默认值
+
+- 默认聊天 provider：`ollama`
+- 默认 Ollama Base URL：`http://127.0.0.1:11434`
+- 默认 Ollama 模型：`qwen3:8b`
+- 默认 OpenAI 兼容 Base URL：`https://api.openai.com/v1`
+- 默认 OpenAI 兼容模型：`gpt-4.1-mini`
+- 默认 Steam 地区 / 语言：`CN` / `zh-CN`
+
+## 备注
+
+- 只填 `SteamID64` 也能进入公开资料兜底模式
+- 如果想显示拥有游戏数和最近游玩数据，仍然需要有效的 Steam Web API Key
+- 当前 UI 是本地优先设计，默认假设敏感数据保留在同一台机器上
