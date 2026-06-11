@@ -1,11 +1,14 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from Agent import Agent
+if TYPE_CHECKING:
+    from Agent.Agent import Agent
+else:
+    from Agent import Agent
 from config import history_path, vector_path
 from profile_store import ProfileStore
 from steam_service import SteamService
