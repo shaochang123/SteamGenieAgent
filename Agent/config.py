@@ -36,6 +36,9 @@ openai_model_name = "gpt-4.1-mini"
 steam_country = "CN"
 steam_language = "zh-CN"
 http_timeout = 60
+# LLM calls can legitimately take longer than ordinary Steam/API requests,
+# especially when the model is deciding whether to call MCP tools.
+llm_http_timeout = 300
 max_knowledge_upload_bytes = 5 * 1024 * 1024
 
 # Retrieval tuning
@@ -63,7 +66,9 @@ system_prompt_with_tools = (
     "4. If a tool returns an error or empty result, explain that clearly, "
     "then try calling it again with different arguments.\n"
     "5. Use default parameter values. Do NOT add filters like installed_only "
-    "unless the user explicitly asks for them.\n\n"
+    "unless the user explicitly asks for them.\n"
+    "6. Do not output code unless the user explicitly asks for code.\n\n"
+    "7. Below is a knowledge base and historical dialogue data, but note that games mentioned in the knowledge base do not necessarily exist in the user's database."
     "Answer clearly and concisely.\n"
     "{knowledge_context}"
     "{history_context}"

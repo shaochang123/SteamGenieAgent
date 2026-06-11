@@ -2,11 +2,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import httpx
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
@@ -18,9 +22,12 @@ from config import (
     embedding_model_name,
     history_path,
     knowledge_path,
+    llm_http_timeout,
     max_split_char_number,
+    max_token,
     md5_path,
     model_name,
+    model_max_token,
     ollama_base_url,
     separators,
     system_prompt,
@@ -38,6 +45,14 @@ _public_knowledge_loaded = False
 _user_knowledge_loaded: set[str] = set()
 _embedding_model: OllamaEmbeddings | None = None
 _vector_store_cache: dict[str, Chroma] = {}
+
+
+def _llm_timeout_message(provider: str, model: str) -> str:
+    return (
+        f"模型请求超时（provider={provider}, model={model}, "
+        f"timeout={llm_http_timeout}s）。请检查本地模型/接口服务是否可用，"
+        "或减少上下文、降低知识库召回数量 k、调大 Agent/config.py 的 llm_http_timeout。"
+    )
 
 
 class Agent:
@@ -266,20 +281,149 @@ class Agent:
             except Exception:
                 pass
 
+    def _active_model_name(self) -> str:
+        ai_settings = self.settings.get("ai", {})
+        provider = ai_settings.get("provider", "ollama")
+        if provider == "openai-compatible":
+            settings = ai_settings.get("openaiCompatible", {})
+            return (settings.get("model") or "").strip() or model_name
+        settings = ai_settings.get("ollama", {})
+        return (settings.get("model") or model_name).strip() or model_name
+
+    def _active_token_limit(self) -> int:
+        chat_model = self._active_model_name()
+        return int(model_max_token.get(chat_model, max_token))
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Approximate tokens without adding a tokenizer dependency."""
+        if not text:
+            return 0
+        pieces = re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]", text)
+        total = 0
+        for piece in pieces:
+            if re.fullmatch(r"[A-Za-z0-9_]+", piece):
+                total += max(1, math.ceil(len(piece) / 4))
+            else:
+                total += 1
+        return total
+
+    def _score_tokens(self, text: str) -> list[str]:
+        return [
+            token.lower()
+            for token in re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+", text)
+            if token.strip()
+        ]
+
+    def _rank_context_blocks(self, question: str, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        query_terms = Counter(self._score_tokens(question))
+        if not blocks or not query_terms:
+            return sorted(blocks, key=lambda item: item["fallback"], reverse=True)
+
+        documents = [set(self._score_tokens(block["text"])) for block in blocks]
+        doc_count = len(documents)
+        df: Counter[str] = Counter()
+        for terms in documents:
+            df.update(terms)
+
+        for block, terms in zip(blocks, documents):
+            block_terms = Counter(self._score_tokens(block["text"]))
+            score = 0.0
+            for term, query_tf in query_terms.items():
+                if term not in block_terms:
+                    continue
+                idf = math.log((doc_count + 1) / (df[term] + 1)) + 1
+                score += query_tf * block_terms[term] * idf
+            block["score"] = score + block["fallback"]
+
+        return sorted(blocks, key=lambda item: item["score"], reverse=True)
+
+    def _split_knowledge_blocks(self, context: str) -> list[str]:
+        return [part.strip() for part in context.split("\n\n") if part.strip()]
+
+    def _render_knowledge_context(self, blocks: list[str]) -> str:
+        if not blocks:
+            return ""
+        return "## Knowledge Base (retrieved references)\n" + "\n\n".join(blocks) + "\n"
+
+    def _render_history_context(self, blocks: list[str]) -> str:
+        if not blocks:
+            return ""
+        return "## Conversation History\n" + "\n".join(blocks) + "\n"
+
+    def _message_token_count(self, prompt_text: str, question: str) -> int:
+        return self._estimate_tokens(prompt_text) + self._estimate_tokens(question)
+
+    def _fit_context_to_budget(
+        self,
+        *,
+        question: str,
+        prompt_template: str,
+        knowledge_blocks: list[str],
+        history_blocks: list[str],
+    ) -> tuple[str, str]:
+        limit = self._active_token_limit()
+        empty_prompt = prompt_template.format(knowledge_context="", history_context="")
+        if self._message_token_count(empty_prompt, question) > limit:
+            raise RuntimeError(
+                f"输入内容超过当前模型 {self._active_model_name()} 的最大上下文长度 {limit} tokens。"
+            )
+
+        candidates: list[dict[str, Any]] = []
+        for index, text in enumerate(knowledge_blocks):
+            candidates.append({
+                "kind": "knowledge",
+                "text": text,
+                "order": index,
+                "fallback": 0.01 / (index + 1),
+            })
+        history_count = len(history_blocks)
+        for index, text in enumerate(history_blocks):
+            candidates.append({
+                "kind": "history",
+                "text": text,
+                "order": index,
+                "fallback": 0.005 * (index + 1) / max(history_count, 1),
+            })
+
+        selected_knowledge: list[dict[str, Any]] = []
+        selected_history: list[dict[str, Any]] = []
+        for block in self._rank_context_blocks(question, candidates):
+            trial_knowledge = selected_knowledge[:]
+            trial_history = selected_history[:]
+            if block["kind"] == "knowledge":
+                trial_knowledge.append(block)
+            else:
+                trial_history.append(block)
+
+            knowledge_text = self._render_knowledge_context(
+                [item["text"] for item in sorted(trial_knowledge, key=lambda item: item["order"])]
+            )
+            history_text = self._render_history_context(
+                [item["text"] for item in sorted(trial_history, key=lambda item: item["order"])]
+            )
+            prompt_text = prompt_template.format(
+                knowledge_context=knowledge_text,
+                history_context=history_text,
+            )
+            if self._message_token_count(prompt_text, question) <= limit:
+                selected_knowledge = trial_knowledge
+                selected_history = trial_history
+
+        knowledge_context = self._render_knowledge_context(
+            [item["text"] for item in sorted(selected_knowledge, key=lambda item: item["order"])]
+        )
+        history_context = self._render_history_context(
+            [item["text"] for item in sorted(selected_history, key=lambda item: item["order"])]
+        )
+        return knowledge_context, history_context
+
     def _build_messages(
         self, question: str, context: str, has_tools: bool = False
     ) -> list[dict[str, str]]:
         """Build provider messages from system prompt, RAG context, and history."""
         prompt_template = system_prompt_with_tools if has_tools else system_prompt
 
-        # ── Knowledge context: RAG results from public + user vector stores ──
-        if context:
-            knowledge_context = (
-                "## Knowledge Base (retrieved references)\n"
-                f"{context}\n"
-            )
-        else:
-            knowledge_context = ""
+        knowledge_blocks = self._split_knowledge_blocks(context)
 
         # ── History context: recent conversation as a labeled text block ──
         _refusal_patterns = [
@@ -305,14 +449,12 @@ class Agent:
             tag = "assistant" if role == "assistant" else "user"
             filtered.append(f"[{tag}]: {content}")
 
-        if filtered:
-            history_context = (
-                "## Conversation History\n"
-                + "\n".join(filtered)
-                + "\n"
-            )
-        else:
-            history_context = ""
+        knowledge_context, history_context = self._fit_context_to_budget(
+            question=question,
+            prompt_template=prompt_template,
+            knowledge_blocks=knowledge_blocks,
+            history_blocks=filtered,
+        )
 
         # ── Assemble prompt ──
         prompt_text = prompt_template.format(
@@ -395,47 +537,59 @@ class Agent:
 
         if stream:
             async def token_stream() -> AsyncIterator[str]:
-                async for line in async_fetch_stream_lines(
-                    config["url"],
-                    method="POST",
-                    payload=payload,
-                    headers=config["headers"],
-                ):
-                    raw = line.strip()
-                    if not raw:
-                        continue
+                try:
+                    async for line in async_fetch_stream_lines(
+                        config["url"],
+                        method="POST",
+                        payload=payload,
+                        headers=config["headers"],
+                        timeout=llm_http_timeout,
+                    ):
+                        raw = line.strip()
+                        if not raw:
+                            continue
 
-                    try:
-                        if config["provider"] == "openai-compatible":
-                            if not raw.startswith("data: "):
-                                continue
-                            data_str = raw[6:]
-                            if data_str == "[DONE]":
-                                break
-                            chunk = json.loads(data_str)
-                            choices = chunk.get("choices") or []
-                            if not choices:
-                                continue
-                            content = choices[0].get("delta", {}).get("content", "")
-                        else:
-                            chunk = json.loads(raw)
-                            content = chunk.get("message", {}).get("content", "")
-                            if chunk.get("done", False):
-                                break
-                    except json.JSONDecodeError:
-                        continue
+                        try:
+                            if config["provider"] == "openai-compatible":
+                                if not raw.startswith("data: "):
+                                    continue
+                                data_str = raw[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                chunk = json.loads(data_str)
+                                choices = chunk.get("choices") or []
+                                if not choices:
+                                    continue
+                                content = choices[0].get("delta", {}).get("content", "")
+                            else:
+                                chunk = json.loads(raw)
+                                content = chunk.get("message", {}).get("content", "")
+                                if chunk.get("done", False):
+                                    break
+                        except json.JSONDecodeError:
+                            continue
 
-                    if content:
-                        yield content
+                        if content:
+                            yield content
+                except httpx.TimeoutException as exc:
+                    raise RuntimeError(
+                        _llm_timeout_message(config["provider"], config["model"])
+                    ) from exc
 
             return token_stream()
 
-        response = await async_fetch_json(
-            config["url"],
-            method="POST",
-            payload=payload,
-            headers=config["headers"],
-        )
+        try:
+            response = await async_fetch_json(
+                config["url"],
+                method="POST",
+                payload=payload,
+                headers=config["headers"],
+                timeout=llm_http_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                _llm_timeout_message(config["provider"], config["model"])
+            ) from exc
         message = self._message_from_response(config["provider"], response)
         return {
             "content": self._content_to_text(message.get("content", "")),
