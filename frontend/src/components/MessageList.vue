@@ -13,13 +13,23 @@
     >
       <div class="message-bubble">
         <p class="message-label">
-          {{ message.role === 'assistant' ? 'AI' : '你' }}
+          {{ message.role === 'tool_call' ? '工具调用' : message.role === 'tool_result' ? '工具结果' : message.role === 'assistant' ? 'AI' : '你' }}
         </p>
-        <div class="message-body" v-html="renderMarkdown(message.content)"></div>
+        <div v-if="message.role === 'tool_call' || message.role === 'tool_result'" class="message-body message-body--tool">
+          {{ message.content }}
+        </div>
+        <div v-else class="message-body" v-html="renderMarkdown(message.content)"></div>
       </div>
     </div>
 
-    <div v-if="loading" class="loading-bubble">
+    <div v-if="loading && streamingContent" class="message-row message-row--assistant">
+      <div class="message-bubble">
+        <p class="message-label">AI</p>
+        <div class="message-body" v-html="renderMarkdown(streamingContent)"></div>
+      </div>
+    </div>
+
+    <div v-else-if="loading" class="loading-bubble">
       <span></span>
       <span></span>
       <span></span>
@@ -45,6 +55,10 @@ export default {
     loading: {
       type: Boolean,
       default: false,
+    },
+    streamingContent: {
+      type: String,
+      default: '',
     },
   },
   watch: {
@@ -155,6 +169,12 @@ export default {
 
 .message-body /deep/ p:last-child {
   margin-bottom: 0;
+}
+
+.message-body--tool {
+  color: #607086;
+  font-style: italic;
+  font-size: 13px;
 }
 
 .message-body /deep/ a {

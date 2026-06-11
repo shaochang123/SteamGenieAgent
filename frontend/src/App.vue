@@ -21,6 +21,7 @@
           :loading="state.loading.conversation"
           :sending="state.loading.sending"
           :error="state.error.chat"
+          :streaming-content="state.streamingContent"
           @open-settings="state.dialogs.settings = true"
           @send-message="handleSendMessage"
         />
@@ -78,7 +79,7 @@ import {
   getSteamOverview,
   listProfiles,
   normalizeError,
-  sendChat,
+  sendChatStream,
   updateProfileConfig,
 } from './api/api'
 import ChatPane from './components/ChatPane.vue'
@@ -315,14 +316,71 @@ export default {
 
       this.state.loading.sending = true
       this.state.error.chat = ''
+      this.state.streamingContent = ''
+
+      // Show user message immediately
+      const timestamp = new Date().toISOString()
+      this.state.messages.push({
+        role: 'user',
+        content: question,
+        timestamp,
+      })
+
+      // Placeholder for assistant response
+      this.state.messages.push({
+        role: 'assistant',
+        content: '',
+        timestamp: '',
+      })
+      const assistantIndex = this.state.messages.length - 1
 
       try {
-        const response = await sendChat(this.state.selectedProfileId, question)
-        this.state.messages = response.data.messages || []
-        await this.refreshProfileSummaries(this.state.selectedProfileId)
+        await sendChatStream(this.state.selectedProfileId, question, 3, {
+          onToken: (content) => {
+            this.state.streamingContent += content
+            this.state.messages[assistantIndex].content += content
+          },
+          onDone: (fullContent) => {
+            this.state.messages[assistantIndex].content = fullContent
+            this.state.messages[assistantIndex].timestamp = new Date().toISOString()
+            this.state.streamingContent = ''
+            this.state.loading.sending = false
+            this.refreshProfileSummaries(this.state.selectedProfileId)
+          },
+          onError: (error) => {
+            this.state.messages.splice(assistantIndex, 1)
+            this.state.streamingContent = ''
+            this.state.error.chat = error
+            this.state.loading.sending = false
+          },
+          onToolStart: (tool) => {
+            this.state.messages.splice(assistantIndex, 0, {
+              role: 'tool_call',
+              content: `正在调用: ${tool}`,
+              timestamp: new Date().toISOString(),
+            })
+            this.state.messages.splice(assistantIndex + 2, 0, {
+              role: 'tool_result',
+              content: '等待结果...',
+              timestamp: new Date().toISOString(),
+            })
+          },
+          onToolResult: (tool, result) => {
+            // Find the tool_result message and update it
+            const toolResultMsg = this.state.messages.find(
+              (m) => m.role === 'tool_result' && m.content === '等待结果...'
+            )
+            if (toolResultMsg) {
+              toolResultMsg.content = result.length > 500
+                ? result.slice(0, 500) + '...'
+                : result
+            }
+          },
+        })
       } catch (error) {
+        this.state.messages.splice(assistantIndex, 1)
+        this.state.streamingContent = ''
         this.state.error.chat = normalizeError(error)
-      } finally {
         this.state.loading.sending = false
       }
     },
@@ -451,6 +509,8 @@ a {
 .panel--chat {
   animation-delay: 0.08s;
   display: flex;
+  flex-direction: column;
+  min-height: 0;
   overflow: hidden;
 }
 

@@ -12,7 +12,9 @@
 
     <p v-if="error" class="error-banner">{{ error }}</p>
 
-    <MessageList :messages="messages" :loading="sending" />
+    <KnowledgeUploader v-if="profile" :profile-id="profile.id" />
+
+    <MessageList :messages="messages" :loading="sending" :streaming-content="streamingContent" />
 
     <ChatComposer
       :disabled="!profile || loading"
@@ -24,12 +26,14 @@
 
 <script>
 import ChatComposer from './ChatComposer.vue'
+import KnowledgeUploader from './KnowledgeUploader.vue'
 import MessageList from './MessageList.vue'
 
 export default {
   name: 'ChatPane',
   components: {
     ChatComposer,
+    KnowledgeUploader,
     MessageList,
   },
   props: {
@@ -50,6 +54,10 @@ export default {
       default: false,
     },
     error: {
+      type: String,
+      default: '',
+    },
+    streamingContent: {
       type: String,
       default: '',
     },

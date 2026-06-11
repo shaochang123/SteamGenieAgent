@@ -19,6 +19,9 @@ legacy_md5_path = BASE_DIR / "md5.txt"
 # Static assets
 knowledge_path = BASE_DIR / "Knowledge"
 
+# User knowledge
+user_knowledge_path = runtime_path / "knowledge"
+
 # Non-sensitive defaults
 user = "system"
 model_name = "qwen3:8b"

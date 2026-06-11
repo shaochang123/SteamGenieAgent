@@ -19,6 +19,7 @@ from config import (
     runtime_path,
     steam_country,
     steam_language,
+    user_knowledge_path,
     vector_path,
 )
 
@@ -45,6 +46,7 @@ class ProfileStore:
         self.profiles_path.mkdir(parents=True, exist_ok=True)
         self.history_path.mkdir(parents=True, exist_ok=True)
         self.vector_path.mkdir(parents=True, exist_ok=True)
+        Path(user_knowledge_path).mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_data()
 
     def _migrate_legacy_data(self) -> None:
@@ -99,6 +101,7 @@ class ProfileStore:
                 "steamId": "",
                 "country": steam_country,
                 "language": steam_language,
+                "proxy": "",
             },
         }
 
@@ -226,6 +229,7 @@ class ProfileStore:
                     "steamId": steam.get("steamId", profile_steam.get("steamId", "")).strip(),
                     "country": steam.get("country", profile_steam.get("country", steam_country)).strip() or steam_country,
                     "language": steam.get("language", profile_steam.get("language", steam_language)).strip() or steam_language,
+                    "proxy": steam.get("proxy", profile_steam.get("proxy", "")).strip(),
                 }
             )
 
@@ -276,6 +280,45 @@ class ProfileStore:
 
     def save_messages(self, profile_id: str, messages: list[dict[str, Any]]) -> None:
         self._write_json(self.history_file_path(profile_id), messages)
+
+    def knowledge_dir(self, profile_id: str) -> Path:
+        dir_path = Path(user_knowledge_path) / profile_id
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path
+
+    def list_knowledge_files(self, profile_id: str) -> dict[str, list[dict[str, Any]]]:
+        public_files: list[dict[str, Any]] = []
+        public_dir = Path(__import__("config").knowledge_path)
+        if public_dir.exists():
+            for f in sorted(public_dir.glob("*.json")):
+                public_files.append({"name": f.name, "size": f.stat().st_size, "source": "public"})
+
+        user_files: list[dict[str, Any]] = []
+        user_dir = self.knowledge_dir(profile_id)
+        for f in sorted(user_dir.glob("*.json")):
+            user_files.append({
+                "name": f.name,
+                "size": f.stat().st_size,
+                "source": "user",
+                "uploadedAt": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
+            })
+
+        return {"public": public_files, "user": user_files}
+
+    def save_knowledge_file(self, profile_id: str, filename: str, content: bytes) -> Path:
+        safe_name = filename.replace("\\", "/").split("/")[-1]
+        if not safe_name.lower().endswith(".json"):
+            raise ValueError("仅支持 .json 文件。")
+        target = self.knowledge_dir(profile_id) / safe_name
+        target.write_bytes(content)
+        return target
+
+    def delete_knowledge_file(self, profile_id: str, filename: str) -> None:
+        safe_name = filename.replace("\\", "/").split("/")[-1]
+        target = self.knowledge_dir(profile_id) / safe_name
+        if not target.exists():
+            raise FileNotFoundError("文件不存在。")
+        target.unlink()
 
     def append_chat_exchange(self, profile_id: str, question: str, answer: str) -> list[dict[str, Any]]:
         timestamp = utc_now()

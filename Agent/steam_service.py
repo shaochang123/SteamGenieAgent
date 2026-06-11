@@ -62,6 +62,7 @@ class SteamService:
         self.steam_id = (steam.get("steamId") or "").strip()
         self.country = (steam.get("country") or steam_country).strip() or steam_country
         self.language = (steam.get("language") or steam_language).strip() or steam_language
+        self.proxy = (steam.get("proxy") or "").strip() or None
 
     @property
     def has_steam_id(self) -> bool:
@@ -77,7 +78,7 @@ class SteamService:
             key=self.api_key,
             **params,
         )
-        return fetch_json(url)
+        return fetch_json(url, proxy=self.proxy)
 
     def _friendly_api_error(self, error: Exception) -> str:
         message = str(error)
@@ -92,7 +93,7 @@ class SteamService:
         if not self.has_steam_id:
             raise RuntimeError("请先配置 SteamID64。")
 
-        xml = fetch_text(f"{STEAM_COMMUNITY_BASE}/profiles/{self.steam_id}?xml=1")
+        xml = fetch_text(f"{STEAM_COMMUNITY_BASE}/profiles/{self.steam_id}?xml=1", proxy=self.proxy)
         steam_id = _extract_tag(xml, "steamID64") or self.steam_id
         persona_name = _extract_tag(xml, "steamID") or steam_id
         avatar_url = _extract_tag(xml, "avatarFull")
@@ -221,7 +222,7 @@ class SteamService:
                 cc=self.country,
                 l=self.language,
             )
-            payload = fetch_json(url)
+            payload = fetch_json(url, proxy=self.proxy)
             specials = payload.get("specials", {}).get("items", [])
             items = []
             for item in specials[:6]:

@@ -93,6 +93,11 @@
               <span>Language</span>
               <input v-model.trim="draft.steam.language" type="text" placeholder="zh-CN">
             </label>
+            <label class="field">
+              <span>HTTP 代理 (Proxy)</span>
+              <input v-model.trim="draft.steam.proxy" type="text" placeholder="http://127.0.0.1:7890">
+              <span class="field-hint">用于访问 Steam API 的代理地址，留空则不使用代理</span>
+            </label>
           </section>
         </div>
 
@@ -133,6 +138,7 @@ function normalizeProfile(profile) {
       steamId: profile.steam?.steamId || '',
       country: profile.steam?.country || 'CN',
       language: profile.steam?.language || 'zh-CN',
+      proxy: profile.steam?.proxy || '',
     },
   }
 }
@@ -327,6 +333,12 @@ h2 {
   outline: none;
   border-color: rgba(61, 126, 255, 0.4);
   box-shadow: 0 0 0 4px rgba(61, 126, 255, 0.12);
+}
+
+.field-hint {
+  color: #8a99ae;
+  font-size: 12px;
+  margin-top: -2px;
 }
 
 .sheet__footer {

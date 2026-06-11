@@ -36,6 +36,7 @@ def fetch_json(
     payload: Any | None = None,
     headers: dict[str, str] | None = None,
     timeout: int = http_timeout,
+    proxy: str | None = None,
 ) -> Any:
     body = None
     final_headers = {"Accept": "application/json"}
@@ -47,8 +48,15 @@ def fetch_json(
         final_headers.setdefault("Content-Type", "application/json")
 
     req = request.Request(url, data=body, headers=final_headers, method=method.upper())
+
+    if proxy:
+        proxy_handler = request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = request.build_opener(proxy_handler)
+    else:
+        opener = request.build_opener()
+
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset("utf-8")
             raw = resp.read().decode(charset)
             if not raw:
@@ -67,14 +75,22 @@ def fetch_text(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     timeout: int = http_timeout,
+    proxy: str | None = None,
 ) -> str:
     final_headers = {"Accept": "*/*"}
     if headers:
         final_headers.update(headers)
 
     req = request.Request(url, headers=final_headers, method=method.upper())
+
+    if proxy:
+        proxy_handler = request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = request.build_opener(proxy_handler)
+    else:
+        opener = request.build_opener()
+
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset("utf-8")
             return resp.read().decode(charset)
     except error.HTTPError as exc:
@@ -82,6 +98,36 @@ def fetch_text(
     except error.URLError as exc:
         reason = exc.reason if hasattr(exc, "reason") else str(exc)
         raise RuntimeError(str(reason)) from exc
+
+
+def fetch_stream(
+    url: str,
+    *,
+    method: str = "POST",
+    payload: Any | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = http_timeout,
+    proxy: str | None = None,
+):
+    """Return a raw urllib response object for line-by-line streaming reads."""
+    body = None
+    final_headers = {}
+    if headers:
+        final_headers.update(headers)
+
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        final_headers.setdefault("Content-Type", "application/json")
+
+    req = request.Request(url, data=body, headers=final_headers, method=method.upper())
+
+    if proxy:
+        proxy_handler = request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = request.build_opener(proxy_handler)
+    else:
+        opener = request.build_opener()
+
+    return opener.open(req, timeout=timeout)
 
 
 def append_query(url: str, **params: Any) -> str:
