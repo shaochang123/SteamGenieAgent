@@ -1,8 +1,9 @@
+import asyncio
 import re
 from typing import Any
 
 from config import steam_country, steam_language
-from http_utils import append_query, fetch_json, fetch_text
+from http_utils import append_query, async_fetch_json, async_fetch_text
 
 
 STEAM_API_BASE = "https://api.steampowered.com"
@@ -72,14 +73,6 @@ class SteamService:
     def has_api_key(self) -> bool:
         return bool(self.api_key)
 
-    def _steam_api(self, interface: str, method: str, version: str, **params: Any) -> Any:
-        url = append_query(
-            f"{STEAM_API_BASE}/{interface}/{method}/v{version}/",
-            key=self.api_key,
-            **params,
-        )
-        return fetch_json(url, proxy=self.proxy)
-
     def _friendly_api_error(self, error: Exception) -> str:
         message = str(error)
         lowered = message.lower()
@@ -89,11 +82,17 @@ class SteamService:
             return "没有找到这个 Steam 用户，请检查 SteamID64。"
         return message
 
-    def _fetch_public_profile(self) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Async methods (used by async FastAPI endpoints)
+    # ------------------------------------------------------------------
+
+    async def _async_fetch_public_profile(self) -> dict[str, Any]:
         if not self.has_steam_id:
             raise RuntimeError("请先配置 SteamID64。")
 
-        xml = fetch_text(f"{STEAM_COMMUNITY_BASE}/profiles/{self.steam_id}?xml=1", proxy=self.proxy)
+        xml = await async_fetch_text(
+            f"{STEAM_COMMUNITY_BASE}/profiles/{self.steam_id}?xml=1", proxy=self.proxy
+        )
         steam_id = _extract_tag(xml, "steamID64") or self.steam_id
         persona_name = _extract_tag(xml, "steamID") or steam_id
         avatar_url = _extract_tag(xml, "avatarFull")
@@ -111,7 +110,7 @@ class SteamService:
             "currentGame": current_game,
         }
 
-    def get_overview(self) -> dict[str, Any]:
+    async def async_get_overview(self) -> dict[str, Any]:
         if not self.has_steam_id:
             return {
                 "configured": False,
@@ -124,7 +123,7 @@ class SteamService:
         public_profile = None
         public_error = ""
         try:
-            public_profile = self._fetch_public_profile()
+            public_profile = await self._async_fetch_public_profile()
         except Exception as exc:
             public_error = f"无法读取公开资料: {exc}"
 
@@ -142,31 +141,44 @@ class SteamService:
             }
 
         try:
-            summary = self._steam_api(
-                "ISteamUser",
-                "GetPlayerSummaries",
-                "0002",
-                steamids=self.steam_id,
+            # Fetch all three Steam API endpoints in parallel
+            summary_task = async_fetch_json(
+                append_query(
+                    f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v0002/",
+                    key=self.api_key,
+                    steamids=self.steam_id,
+                ),
+                proxy=self.proxy,
             )
+            owned_task = async_fetch_json(
+                append_query(
+                    f"{STEAM_API_BASE}/IPlayerService/GetOwnedGames/v0001/",
+                    key=self.api_key,
+                    steamid=self.steam_id,
+                    include_appinfo="1",
+                    include_played_free_games="1",
+                ),
+                proxy=self.proxy,
+            )
+            recent_task = async_fetch_json(
+                append_query(
+                    f"{STEAM_API_BASE}/IPlayerService/GetRecentlyPlayedGames/v0001/",
+                    key=self.api_key,
+                    steamid=self.steam_id,
+                ),
+                proxy=self.proxy,
+            )
+
+            summary, owned_games_raw, recent_games_raw = await asyncio.gather(
+                summary_task, owned_task, recent_task
+            )
+
             player = (summary.get("response", {}).get("players") or [None])[0]
             if not player:
                 raise RuntimeError("没有找到这个 Steam 用户，请检查 SteamID64。")
 
-            owned_games = self._steam_api(
-                "IPlayerService",
-                "GetOwnedGames",
-                "0001",
-                steamid=self.steam_id,
-                include_appinfo="1",
-                include_played_free_games="1",
-            ).get("response", {})
-
-            recent_games = self._steam_api(
-                "IPlayerService",
-                "GetRecentlyPlayedGames",
-                "0001",
-                steamid=self.steam_id,
-            ).get("response", {})
+            owned_games = owned_games_raw.get("response", {})
+            recent_games = recent_games_raw.get("response", {})
 
             recent_items = []
             for item in (recent_games.get("games") or [])[:4]:
@@ -215,14 +227,14 @@ class SteamService:
                 "recentGames": [],
             }
 
-    def get_deals(self) -> dict[str, Any]:
+    async def async_get_deals(self) -> dict[str, Any]:
         try:
             url = append_query(
                 f"{STEAM_STORE_BASE}/api/featuredcategories/",
                 cc=self.country,
                 l=self.language,
             )
-            payload = fetch_json(url, proxy=self.proxy)
+            payload = await async_fetch_json(url, proxy=self.proxy)
             specials = payload.get("specials", {}).get("items", [])
             items = []
             for item in specials[:6]:

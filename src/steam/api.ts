@@ -13,6 +13,32 @@ import type {
 const STEAM_API_BASE = "https://api.steampowered.com";
 const STEAM_STORE_BASE = "https://store.steampowered.com";
 
+// Node.js built-in fetch (undici-based) does NOT respect HTTP_PROXY env vars.
+// Build a shared ProxyAgent when a proxy is configured.
+let _proxyDispatcher: any = undefined;
+function _initProxy(): void {
+  if (_proxyDispatcher !== undefined) return;
+  const proxyUrl =
+    process.env.HTTP_PROXY || process.env.HTTPS_PROXY || "";
+  if (!proxyUrl) {
+    _proxyDispatcher = null; // sentinel: no proxy
+    return;
+  }
+  try {
+    // undici is available as a built-in in Node 18+
+    const { ProxyAgent } = require("undici") as typeof import("undici");
+    _proxyDispatcher = new ProxyAgent(proxyUrl);
+  } catch {
+    _proxyDispatcher = null;
+  }
+}
+
+function _fetchOptions(): Record<string, unknown> {
+  _initProxy();
+  if (_proxyDispatcher) return { dispatcher: _proxyDispatcher };
+  return {};
+}
+
 export class SteamApiClient {
   readonly apiKey: string;
   readonly steamId: string;
@@ -33,7 +59,7 @@ export class SteamApiClient {
   // ---- HTTP Helpers ----
 
   private async fetchJson<T>(url: string): Promise<T> {
-    const resp = await fetch(url);
+    const resp = await fetch(url, _fetchOptions());
     if (!resp.ok) {
       throw new Error(`Steam API returned ${resp.status}: ${resp.statusText}`);
     }
@@ -200,7 +226,8 @@ export class SteamApiClient {
   ): Promise<string> {
     try {
       const resp = await fetch(
-        `${STEAM_STORE_BASE}/api/appdetails?appids=${appid}&cc=${country}&l=${language}`
+        `${STEAM_STORE_BASE}/api/appdetails?appids=${appid}&cc=${country}&l=${language}`,
+        _fetchOptions()
       );
       const data = (await resp.json()) as Record<
         string,
@@ -218,7 +245,8 @@ export class SteamApiClient {
   async getAppPriceInfo(appid: number): Promise<Record<string, CountryPrice>> {
     try {
       const resp = await fetch(
-        `https://store.steampowered.com/api/appdetails?appids=${appid}&filters=price_overview`
+        `https://store.steampowered.com/api/appdetails?appids=${appid}&filters=price_overview`,
+        _fetchOptions()
       );
       const data = (await resp.json()) as Record<string, { success: boolean; data: { price_overview: CountryPrice } }>;
       const entry = data[String(appid)];

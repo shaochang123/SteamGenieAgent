@@ -6,6 +6,33 @@ from pathlib import Path
 from typing import Any
 
 
+# Fields in JSON Schema that Ollama rejects in tool parameters.
+_SCHEMA_REJECTED_KEYS = frozenset({"$schema", "additionalProperties", "title"})
+
+
+def _clean_schema(params: dict[str, Any]) -> dict[str, Any]:
+    """Remove JSON Schema meta fields that cause Ollama 400 errors."""
+    out: dict[str, Any] = {}
+    for key, value in params.items():
+        if key in _SCHEMA_REJECTED_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            cleaned_props: dict[str, Any] = {}
+            for prop_name, prop_schema in value.items():
+                if isinstance(prop_schema, dict):
+                    cleaned_props[prop_name] = {
+                        k: v
+                        for k, v in prop_schema.items()
+                        if k not in _SCHEMA_REJECTED_KEYS
+                    }
+                else:
+                    cleaned_props[prop_name] = prop_schema
+            out[key] = cleaned_props
+        else:
+            out[key] = value
+    return out
+
+
 class MCPClientManager:
     def __init__(self, profile: dict[str, Any]) -> None:
         self._profile = profile
@@ -111,6 +138,11 @@ class MCPClientManager:
             elif isinstance(tool, dict) and "inputSchema" in tool:
                 params = tool["inputSchema"]
 
+            # Ollama rejects $schema, additionalProperties, and other JSON Schema
+            # meta fields that the MCP SDK includes. Strip them to avoid 400 errors.
+            if isinstance(params, dict):
+                params = _clean_schema(params)
+
             name = tool.name if hasattr(tool, "name") else tool.get("name", "")
             desc = tool.description if hasattr(tool, "description") else tool.get("description", "")
             definitions.append({
@@ -118,3 +150,57 @@ class MCPClientManager:
                 "function": {"name": name, "description": desc, "parameters": params},
             })
         return definitions
+
+
+class PersistentMCPClientManager:
+    """Long-lived MCP client wrapper that reuses a single subprocess across
+    multiple requests for the same profile.  Includes a health-check that
+    auto-restarts the subprocess if it has died."""
+
+    def __init__(self, profile: dict[str, Any]) -> None:
+        self._profile = profile
+        self._manager: MCPClientManager | None = None
+
+    async def start(self) -> list[Any]:
+        if self._manager is not None:
+            return self._manager.tools
+        self._manager = MCPClientManager(self._profile)
+        return await self._manager.start()
+
+    async def stop(self) -> None:
+        if self._manager is not None:
+            await self._manager.stop()
+            self._manager = None
+
+    async def health_check(self) -> bool:
+        """Return True if the underlying MCP subprocess is still alive."""
+        if self._manager is None or self._manager._session is None:
+            return False
+        try:
+            await self._manager._session.list_tools()
+            return True
+        except Exception:
+            return False
+
+    async def ensure_healthy(self) -> None:
+        """Restart the MCP subprocess if health check fails."""
+        if not await self.health_check():
+            logger = __import__("logging").getLogger("MCP")
+            logger.warning("MCP health check failed, restarting subprocess...")
+            await self.stop()
+            await self.start()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        await self.ensure_healthy()
+        if self._manager is None:
+            raise RuntimeError("MCP client not started.")
+        return await self._manager.call_tool(name, arguments)
+
+    def get_tool_definitions(self) -> list[dict[str, Any]]:
+        if self._manager is None:
+            return []
+        return self._manager.get_tool_definitions()
+
+    @property
+    def is_running(self) -> bool:
+        return self._manager is not None and self._manager._session is not None

@@ -22,14 +22,7 @@
       </div>
     </div>
 
-    <div v-if="loading && streamingContent" class="message-row message-row--assistant">
-      <div class="message-bubble">
-        <p class="message-label">AI</p>
-        <div class="message-body" v-html="renderMarkdown(streamingContent)"></div>
-      </div>
-    </div>
-
-    <div v-else-if="loading" class="loading-bubble">
+    <div v-if="loading && !streamingContent" class="loading-bubble">
       <span></span>
       <span></span>
       <span></span>

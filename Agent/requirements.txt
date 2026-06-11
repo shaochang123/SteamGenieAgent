@@ -5,3 +5,5 @@ langchain-core>=0.3.0
 langchain-ollama>=0.1.0
 langchain-text-splitters>=0.3.0
 mcp>=1.0.0
+python-multipart>=0.0.32
+httpx>=0.28.0

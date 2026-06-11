@@ -236,18 +236,33 @@ export function registerLibraryTools(
   // ---- launch_game ----
   server.tool(
     "launch_game",
-    "通过 Steam 启动一款游戏。传入游戏的 AppID 即可启动。",
+    "通过 Steam 启动一款游戏。传入游戏的 AppID 即可启动。只能启动你已拥有的游戏。",
     {
-      appid: z.number().describe("Steam 游戏的 AppID"),
+      appid: z.number().describe("Steam 游戏的 AppID（必须是已拥有的游戏）"),
     },
     async ({ appid }) => {
+      // Verify ownership before attempting to launch
+      const games = await api.getOwnedGames();
+      const owned = games.find((g) => g.appid === appid);
+      if (!owned) {
+        const ownedIds = games.map((g) => g.appid).join(", ");
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `❌ 你没有拥有 AppID ${appid} 的游戏，无法启动。\n\n你拥有的游戏 AppID: ${ownedIds.substring(0, 500)}`,
+            },
+          ],
+        };
+      }
+
       const result = await launchGame(appid);
       return {
         content: [
           {
             type: "text" as const,
             text: result.success
-              ? `🚀 ${result.message}\n已尝试启动 AppID: ${appid}`
+              ? `🚀 ${result.message}\n已尝试启动 **${owned.name}** (AppID: ${appid})`
               : `❌ ${result.message}`,
           },
         ],

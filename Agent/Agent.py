@@ -1,8 +1,9 @@
+import asyncio
 import hashlib
 import json
+import logging
 import os
-import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,12 +24,18 @@ from config import (
     ollama_base_url,
     separators,
     system_prompt,
+    system_prompt_with_tools,
     user_knowledge_path,
     vector_path,
 )
-from http_utils import fetch_json, fetch_stream
+from http_utils import async_fetch_json, async_fetch_stream_lines
+
+logger = logging.getLogger("Agent")
 
 _public_knowledge_loaded = False
+_user_knowledge_loaded: set[str] = set()
+_embedding_model: OllamaEmbeddings | None = None
+_vector_store_cache: dict[str, Chroma] = {}
 
 
 class Agent:
@@ -57,7 +64,8 @@ class Agent:
         Path(md5_path).parent.mkdir(parents=True, exist_ok=True)
 
         self._load_public_knowledge()
-        self._load_user_knowledge(self.session_id)
+        # User knowledge is loaded lazily in _retrieve() to avoid
+        # per-request file I/O overhead.
 
     @property
     def messages(self) -> list[dict[str, Any]]:
@@ -110,16 +118,18 @@ class Agent:
         with self.file_path.open("w", encoding="utf-8") as handle:
             json.dump(messages, handle, ensure_ascii=False, indent=2)
 
-    def clear(self) -> None:
-        self._write_messages([])
-
     def _get_vector_store(self) -> Chroma:
-        embedding_function = OllamaEmbeddings(model=embedding_model_name)
-        return Chroma(
-            collection_name="SteamGames",
-            embedding_function=embedding_function,
-            persist_directory=str(self.vector_root),
-        )
+        global _embedding_model, _vector_store_cache
+        if _embedding_model is None:
+            _embedding_model = OllamaEmbeddings(model=embedding_model_name)
+        key = str(self.vector_root)
+        if key not in _vector_store_cache:
+            _vector_store_cache[key] = Chroma(
+                collection_name="SteamGames",
+                embedding_function=_embedding_model,
+                persist_directory=key,
+            )
+        return _vector_store_cache[key]
 
     def _md5_file(self, profile_id: str = "shared") -> Path:
         if profile_id == "shared":
@@ -143,7 +153,7 @@ class Agent:
         with open(self._md5_file(profile_id), "a", encoding="utf-8") as handle:
             handle.write(f"{md5_hex}\n")
 
-    def addKnowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
+    def add_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
         if self.check_md5(knowledge, profile_id=profile_id):
             return f"[Failed]The {filename} already exists"
 
@@ -168,13 +178,25 @@ class Agent:
 
     def format_func(self, docs: list[Document]) -> str:
         if not docs:
-            return "No related references"
+            return ""
 
-        return "\n\n".join(
-            [f"Reference {index + 1}:\n{doc.page_content}" for index, doc in enumerate(docs)]
-        )
+        parts: list[str] = []
+        for index, doc in enumerate(docs):
+            text = doc.page_content.strip()
+            # Cap each reference to avoid bloating the system prompt and
+            # causing Ollama 400 errors on large payloads.
+            if len(text) > 600:
+                text = text[:600] + "..."
+            parts.append(f"Reference {index + 1}:\n{text}")
+        return "\n\n".join(parts)
 
-    def _retrieve_context(self, question: str, k: int, profile_id: str | None = None) -> str:
+    def _retrieve(self, question: str, k: int, profile_id: str | None = None) -> str:
+        # Lazily load user knowledge on first retrieval for this profile
+        global _user_knowledge_loaded
+        if profile_id and profile_id != "shared" and profile_id not in _user_knowledge_loaded:
+            self._load_user_knowledge(profile_id)
+            _user_knowledge_loaded.add(profile_id)
+
         try:
             search_kwargs: dict[str, Any] = {"k": k}
             if profile_id:
@@ -182,8 +204,14 @@ class Agent:
             retriever = self._get_vector_store().as_retriever(search_kwargs=search_kwargs)
             docs = retriever.invoke(question)
             return self.format_func(docs)
-        except Exception:
-            return "No related references"
+        except Exception as exc:
+            logger.warning("RAG retrieval failed for profile=%s: %s", profile_id, exc)
+            return ""
+
+    async def _retrieve_async(self, question: str, k: int, profile_id: str | None = None) -> str:
+        """Async wrapper — runs the synchronous Chroma query in a thread executor
+        so it doesn't block the FastAPI event loop."""
+        return await asyncio.to_thread(self._retrieve, question, k, profile_id)
 
     def _load_public_knowledge(self) -> None:
         global _public_knowledge_loaded
@@ -198,7 +226,7 @@ class Agent:
         for json_file in public_dir.glob("*.json"):
             try:
                 content = json_file.read_text(encoding="utf-8")
-                self.addKnowledge(content, json_file.name, profile_id="shared")
+                self.add_knowledge(content, json_file.name, profile_id="shared")
             except Exception:
                 pass
 
@@ -210,52 +238,75 @@ class Agent:
         for json_file in user_dir.glob("*.json"):
             try:
                 content = json_file.read_text(encoding="utf-8")
-                self.addKnowledge(content, json_file.name, profile_id=profile_id)
+                self.add_knowledge(content, json_file.name, profile_id=profile_id)
             except Exception:
                 pass
 
-    def _build_messages(self, question: str, context: str) -> list[dict[str, str]]:
-        messages = [{"role": "system", "content": system_prompt.format(context=context)}]
-        for message in self.messages[-10:]:
-            role = "assistant" if message.get("role") == "assistant" else "user"
-            messages.append({"role": role, "content": message.get("content", "")})
-        messages.append({"role": "user", "content": question})
-        return messages
+    def _build_messages(
+        self, question: str, context: str, has_tools: bool = False
+    ) -> list[dict[str, str]]:
+        prompt_template = system_prompt_with_tools if has_tools else system_prompt
 
-    def _call_ollama(self, messages: list[dict[str, str]]) -> str:
+        # ── Knowledge context: RAG results from public + user vector stores ──
+        if context:
+            knowledge_context = (
+                "## Knowledge Base (retrieved references)\n"
+                f"{context}\n"
+            )
+        else:
+            knowledge_context = ""
+
+        # ── History context: recent conversation as a labeled text block ──
+        _refusal_patterns = [
+            "我无法直接访问", "我无法访问", "我没有权限",
+            "我无法直接查看", "我无法直接获取", "我没法直接",
+            "无法直接访问", "无法直接查看", "无法直接获取",
+            "I can't access", "I cannot access",
+        ]
+        filtered: list[str] = []
+        for message in self.messages[-10:]:
+            role = message.get("role", "")
+            content = message.get("content", "")
+
+            if role in ("tool_call", "tool_result", "tool"):
+                continue
+            if role == "assistant" and any(p in content for p in _refusal_patterns):
+                continue
+
+            tag = "assistant" if role == "assistant" else "user"
+            filtered.append(f"[{tag}]: {content}")
+
+        if filtered:
+            history_context = (
+                "## Conversation History\n"
+                + "\n".join(filtered)
+                + "\n"
+            )
+        else:
+            history_context = ""
+
+        # ── Assemble prompt ──
+        prompt_text = prompt_template.format(
+            knowledge_context=knowledge_context,
+            history_context=history_context,
+        )
+        return [
+            {"role": "system", "content": prompt_text},
+            {"role": "user", "content": question},
+        ]
+
+    async def _ollama(self, messages: list[dict[str, str]]) -> str:
+        """Async version using httpx — does not block the event loop."""
         ai_settings = self.settings.get("ai", {})
         ollama_settings = ai_settings.get("ollama", {})
         base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
         chat_model = (ollama_settings.get("model") or model_name).strip() or model_name
         payload = {"model": chat_model, "messages": messages, "stream": False}
-        response = fetch_json(f"{base_url}/api/chat", method="POST", payload=payload)
+        response = await async_fetch_json(f"{base_url}/api/chat", method="POST", payload=payload)
         return response.get("message", {}).get("content", "").strip()
 
-    def _call_ollama_stream(self, messages: list[dict[str, str]]):
-        ai_settings = self.settings.get("ai", {})
-        ollama_settings = ai_settings.get("ollama", {})
-        base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
-        chat_model = (ollama_settings.get("model") or model_name).strip() or model_name
-        payload = {"model": chat_model, "messages": messages, "stream": True}
-        resp = fetch_stream(f"{base_url}/api/chat", method="POST", payload=payload)
-        try:
-            for line in resp:
-                raw = line.decode("utf-8").strip()
-                if not raw:
-                    continue
-                try:
-                    chunk = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                content = chunk.get("message", {}).get("content", "")
-                if content:
-                    yield content
-                if chunk.get("done", False):
-                    break
-        finally:
-            resp.close()
-
-    def _call_openai_compatible(self, messages: list[dict[str, str]]) -> str:
+    async def _openai(self, messages: list[dict[str, str]]) -> str:
+        """Async version using httpx — does not block the event loop."""
         ai_settings = self.settings.get("ai", {})
         openai_settings = ai_settings.get("openaiCompatible", {})
         api_key = (openai_settings.get("apiKey") or "").strip()
@@ -266,7 +317,7 @@ class Agent:
             raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
 
         payload = {"model": chat_model, "messages": messages}
-        response = fetch_json(
+        response = await async_fetch_json(
             f"{base_url}/chat/completions",
             method="POST",
             payload=payload,
@@ -283,7 +334,29 @@ class Agent:
             ).strip()
         return str(content).strip()
 
-    def _call_openai_compatible_stream(self, messages: list[dict[str, str]]):
+    async def _ollama_stream(self, messages: list[dict[str, str]]):
+        """Async version of _call_ollama_stream using httpx."""
+        ai_settings = self.settings.get("ai", {})
+        ollama_settings = ai_settings.get("ollama", {})
+        base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
+        chat_model = (ollama_settings.get("model") or model_name).strip() or model_name
+        payload = {"model": chat_model, "messages": messages, "stream": True}
+        async for line in async_fetch_stream_lines(f"{base_url}/api/chat", method="POST", payload=payload):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            content = chunk.get("message", {}).get("content", "")
+            if content:
+                yield content
+            if chunk.get("done", False):
+                break
+
+    async def _openai_stream(self, messages: list[dict[str, str]]):
+        """Async version of _call_openai_compatible_stream using httpx."""
         ai_settings = self.settings.get("ai", {})
         openai_settings = ai_settings.get("openaiCompatible", {})
         api_key = (openai_settings.get("apiKey") or "").strip()
@@ -294,37 +367,42 @@ class Agent:
             raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
 
         payload = {"model": chat_model, "messages": messages, "stream": True}
-        resp = fetch_stream(
-            f"{base_url}/chat/completions",
-            method="POST",
-            payload=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        try:
-            for line in resp:
-                raw = line.decode("utf-8").strip()
-                if not raw or not raw.startswith("data: "):
-                    continue
-                data_str = raw[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    yield content
-        finally:
-            resp.close()
+        headers = {"Authorization": f"Bearer {api_key}"}
+        async for line in async_fetch_stream_lines(
+            f"{base_url}/chat/completions", method="POST", payload=payload, headers=headers
+        ):
+            raw = line.strip()
+            if not raw or not raw.startswith("data: "):
+                continue
+            data_str = raw[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                yield content
 
-    def _call_ollama_with_tools(
+    async def _provider_stream(self, messages: list[dict[str, str]]):
+        """Async generator: yield tokens from the configured provider."""
+        provider = self.settings.get("ai", {}).get("provider", "ollama")
+        if provider == "openai-compatible":
+            async for token in self._openai_stream(messages):
+                yield token
+        else:
+            async for token in self._ollama_stream(messages):
+                yield token
+
+    async def _ollama_tools(
         self, messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]]
-    ):
+    ) -> list[dict[str, Any]] | str:
+        """Async version using httpx — does not block the event loop."""
         ai_settings = self.settings.get("ai", {})
         ollama_settings = ai_settings.get("ollama", {})
         base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
@@ -335,21 +413,56 @@ class Agent:
             "tools": tool_defs,
             "stream": False,
         }
-        response = fetch_json(f"{base_url}/api/chat", method="POST", payload=payload)
+        logger.info(
+            "Ollama tool call: model=%s tools=%d messages=%d url=%s",
+            chat_model, len(tool_defs), len(messages), base_url,
+        )
+        print(
+            f"[Agent] calling Ollama with {len(tool_defs)} tools, "
+            f"{len(messages)} messages, model={chat_model}",
+            flush=True,
+        )
+        try:
+            response = await async_fetch_json(f"{base_url}/api/chat", method="POST", payload=payload)
+        except Exception:
+            dump_path = Path(__file__).parent / "_ollama_payload_dump.json"
+            try:
+                dump_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                print(f"[Agent] 400 payload dumped to {dump_path}", flush=True)
+            except Exception:
+                pass
+            raise
         msg = response.get("message", {})
         if msg.get("tool_calls"):
-            tc = msg["tool_calls"][0]
-            func = tc.get("function", {})
-            return {
-                "id": tc.get("id", ""),
-                "name": func.get("name", ""),
-                "arguments": func.get("arguments", {}),
-            }
-        return msg.get("content", "").strip()
+            print(f"[Agent] Ollama returned {len(msg['tool_calls'])} tool_calls", flush=True)
+            logger.info("Ollama returned %d tool_calls", len(msg["tool_calls"]))
+            results: list[dict[str, Any]] = []
+            for tc in msg["tool_calls"]:
+                func = tc.get("function", {})
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                results.append({
+                    "id": tc.get("id", ""),
+                    "name": func.get("name", ""),
+                    "arguments": args,
+                })
+            return results
+        content = msg.get("content", "").strip()
+        print(f"[Agent] Ollama returned text (no tool_calls): {content[:120]}...", flush=True)
+        logger.info("Ollama returned text (no tool_calls): %s", content[:200])
+        return content
 
-    def _call_openai_compatible_with_tools(
+    async def _openai_tools(
         self, messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]]
-    ):
+    ) -> list[dict[str, Any]] | str:
+        """Async version using httpx — does not block the event loop."""
         ai_settings = self.settings.get("ai", {})
         openai_settings = ai_settings.get("openaiCompatible", {})
         api_key = (openai_settings.get("apiKey") or "").strip()
@@ -360,7 +473,7 @@ class Agent:
             raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
 
         payload = {"model": chat_model, "messages": messages, "tools": tool_defs}
-        response = fetch_json(
+        response = await async_fetch_json(
             f"{base_url}/chat/completions",
             method="POST",
             payload=payload,
@@ -372,219 +485,195 @@ class Agent:
 
         msg = choice.get("message", {})
         if msg.get("tool_calls"):
-            tc = msg["tool_calls"][0]
-            func = tc.get("function", {})
-            args = func.get("arguments", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            return {"id": tc.get("id", ""), "name": func.get("name", ""), "arguments": args}
+            results: list[dict[str, Any]] = []
+            for tc in msg["tool_calls"]:
+                func = tc.get("function", {})
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                results.append({
+                    "id": tc.get("id", ""),
+                    "name": func.get("name", ""),
+                    "arguments": args,
+                })
+            return results
         return str(msg.get("content", "")).strip()
 
-    def _call_provider_with_tools(
+    async def _provider_tools(
         self, messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]]
-    ):
+    ) -> list[dict[str, Any]] | str:
+        """Async version — does not block the event loop."""
         provider = self.settings.get("ai", {}).get("provider", "ollama")
         if provider == "openai-compatible":
-            return self._call_openai_compatible_with_tools(messages, tool_defs)
-        return self._call_ollama_with_tools(messages, tool_defs)
+            return await self._openai_tools(messages, tool_defs)
+        return await self._ollama_tools(messages, tool_defs)
 
-    def _call_provider(self, messages: list[dict[str, str]]) -> str:
+    async def _provider(self, messages: list[dict[str, str]]) -> str:
+        """Async version — does not block the event loop."""
         provider = self.settings.get("ai", {}).get("provider", "ollama")
         if provider == "openai-compatible":
-            return self._call_openai_compatible(messages)
-        return self._call_ollama(messages)
+            return await self._openai(messages)
+        return await self._ollama(messages)
 
-    def _call_provider_stream(self, messages: list[dict[str, str]]):
+    # ------------------------------------------------------------------
+    # Tool-calling helpers
+    # ------------------------------------------------------------------
+
+    def _build_tool_call_messages(
+        self, messages: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Append assistant tool_calls and tool result messages to *messages*.
+        Returns list of (tool_name, tool_args, tool_call_id) tuples for execution."""
         provider = self.settings.get("ai", {}).get("provider", "ollama")
-        if provider == "openai-compatible":
-            yield from self._call_openai_compatible_stream(messages)
-        else:
-            yield from self._call_ollama_stream(messages)
-
-    def Call(self, question: str, k: int = 3, verbose: bool = False) -> str:
-        context = self._retrieve_context(question, k, profile_id=self.session_id)
-        messages = self._build_messages(question, context)
-        response = self._call_provider(messages)
-        history = self.messages
-        timestamp = datetime.utcnow().isoformat()
-        history.extend(
-            [
-                {"role": "user", "content": question, "timestamp": timestamp},
-                {
-                    "role": "assistant",
-                    "content": response,
-                    "timestamp": datetime.utcnow().isoformat(),
+        tool_entries: list[dict[str, Any]] = []
+        for tc in tool_calls:
+            args = tc.get("arguments", {})
+            # Ollama expects arguments as a plain JSON object (dict).
+            # OpenAI-compatible providers expect a JSON-encoded string.
+            if provider != "ollama":
+                args = json.dumps(args, ensure_ascii=False)
+            tool_entries.append({
+                "id": tc.get("id", "call_1"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name", ""),
+                    "arguments": args,
                 },
-            ]
-        )
-        self._write_messages(history)
-        if verbose:
-            print(response, end="", flush=True)
-        return response
+            })
 
-    def Call_stream(self, question: str, k: int = 3):
-        context = self._retrieve_context(question, k, profile_id=self.session_id)
-        messages = self._build_messages(question, context)
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": tool_entries,
+        })
+        return tool_entries
 
-        timestamp = datetime.utcnow().isoformat()
-        yield {"type": "meta", "user_message": question, "timestamp": timestamp}
+    # ------------------------------------------------------------------
+    # Non-streaming tool loop
+    # ------------------------------------------------------------------
 
-        full_response = ""
-        try:
-            for token in self._call_provider_stream(messages):
-                full_response += token
-                yield {"type": "token", "content": token}
-        except Exception as exc:
-            yield {"type": "error", "content": str(exc)}
-            return
-
-        yield {"type": "done", "content": full_response}
-
-        history = self.messages
-        history.extend(
-            [
-                {"role": "user", "content": question, "timestamp": timestamp},
-                {
-                    "role": "assistant",
-                    "content": full_response,
-                    "timestamp": datetime.utcnow().isoformat(),
-                },
-            ]
-        )
-        self._write_messages(history)
-
-    async def Call_with_tools(self, question: str, k: int = 3) -> str:
-        context = self._retrieve_context(question, k, profile_id=self.session_id)
-        messages: list[dict[str, Any]] = self._build_messages(question, context)
+    async def chat(self, question: str, k: int = 3) -> str:
+        context = await self._retrieve_async(question, k, profile_id=self.session_id)
+        messages: list[dict[str, Any]] = self._build_messages(question, context, has_tools=True)
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         if self._mcp_client is None:
-            return self._call_provider(messages)
+            response = await self._provider(messages)
+            self._persist_chat(question, response, timestamp, messages)
+            return response
 
         tool_defs = self._mcp_client.get_tool_definitions()
+        tool_history: list[dict[str, Any]] = []  # for persistence
 
         for _turn in range(5):
-            result = self._call_provider_with_tools(messages, tool_defs)
+            result = await self._provider_tools(messages, tool_defs)
 
             if isinstance(result, str):
                 response = result
-                break
+                self._persist_chat(question, response, timestamp, messages, tool_history)
+                return response
 
-            tool_name = result.get("name", "")
-            tool_args = result.get("arguments", {})
-            try:
-                tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
-            except Exception as exc:
-                tool_result = f"工具调用失败: {exc}"
+            # Multiple tool calls in one turn
+            entries = self._build_tool_call_messages(messages, result)
+            for entry in entries:
+                tool_history.append({"role": "tool_call", "content": json.dumps(entry, ensure_ascii=False)})
 
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": result.get("id", "call_1"),
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": json.dumps(tool_args, ensure_ascii=False)},
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": result.get("id", "call_1"),
-                "content": tool_result,
-            })
-        else:
-            messages.append({
-                "role": "user",
-                "content": "请基于以上工具调用结果给出最终答案。",
-            })
-            response = self._call_provider(messages)
+            for tc in result:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("arguments", {})
+                try:
+                    tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
+                except Exception as exc:
+                    tool_result = f"工具调用失败: {exc}"
 
-        history = self.messages
-        timestamp = datetime.utcnow().isoformat()
-        history.extend([
-            {"role": "user", "content": question, "timestamp": timestamp},
-            {"role": "assistant", "content": response, "timestamp": datetime.utcnow().isoformat()},
-        ])
-        self._write_messages(history)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", "call_1"),
+                    "content": tool_result,
+                })
+                tool_history.append({"role": "tool_result", "content": tool_result})
+
+        # Max turns reached — ask for final answer
+        messages.append({
+            "role": "user",
+            "content": "请基于以上工具调用结果给出最终答案。",
+        })
+        response = await self._provider(messages)
+        self._persist_chat(question, response, timestamp, messages, tool_history)
         return response
 
-    def Call_stream_with_tools(self, question: str, k: int = 3):
-        # This is a synchronous generator that wraps the async tool loop.
-        # For SSE streaming, we run the async loop internally and yield events.
-        import asyncio
+    # ------------------------------------------------------------------
+    # Streaming tool loop (true async generator — no event loop nesting)
+    # ------------------------------------------------------------------
 
-        loop = asyncio.new_event_loop()
-        try:
-            result = loop.run_until_complete(self._async_stream_with_tools(question, k))
-            for event in result:
-                yield event
-        finally:
-            loop.close()
-
-    async def _async_stream_with_tools(self, question: str, k: int = 3):
-        context = self._retrieve_context(question, k, profile_id=self.session_id)
-        messages: list[dict[str, Any]] = self._build_messages(question, context)
-
-        timestamp = datetime.utcnow().isoformat()
+    async def chat_stream(self, question: str, k: int = 3):
+        """Async generator: yield SSE events for streaming chat with MCP tools."""
+        context = await self._retrieve_async(question, k, profile_id=self.session_id)
+        messages: list[dict[str, Any]] = self._build_messages(question, context, has_tools=True)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        tool_history: list[dict[str, Any]] = []
         yield {"type": "meta", "user_message": question, "timestamp": timestamp}
 
         if self._mcp_client is None:
+            print("[Agent] No MCP client — streaming without tools", flush=True)
+            logger.info("No MCP client — streaming without tools")
             full = ""
             try:
-                for token in self._call_provider_stream(messages):
+                async for token in self._provider_stream(messages):
                     full += token
                     yield {"type": "token", "content": token}
             except Exception as exc:
                 yield {"type": "error", "content": str(exc)}
                 return
             yield {"type": "done", "content": full}
-            self._persist_stream_chat(question, full, timestamp)
+            self._persist_chat(question, full, timestamp, messages)
             return
 
         tool_defs = self._mcp_client.get_tool_definitions()
+        print(f"[Agent] MCP client ready, {len(tool_defs)} tool definitions", flush=True)
+        logger.info("MCP streaming with %d tool definitions", len(tool_defs))
 
         for _turn in range(5):
-            result = self._call_provider_with_tools(messages, tool_defs)
+            result = await self._provider_tools(messages, tool_defs)
 
             if isinstance(result, str):
                 full = ""
                 try:
-                    for token in self._call_provider_stream(messages):
+                    async for token in self._provider_stream(messages):
                         full += token
                         yield {"type": "token", "content": token}
                 except Exception as exc:
                     yield {"type": "error", "content": str(exc)}
                     return
                 yield {"type": "done", "content": full}
-                self._persist_stream_chat(question, full, timestamp)
+                self._persist_chat(question, full, timestamp, messages, tool_history)
                 return
 
-            tool_name = result.get("name", "")
-            tool_args = result.get("arguments", {})
-            yield {"type": "tool_start", "tool": tool_name}
+            entries = self._build_tool_call_messages(messages, result)
+            for entry in entries:
+                tool_history.append({"role": "tool_call", "content": json.dumps(entry, ensure_ascii=False)})
 
-            try:
-                tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
-            except Exception as exc:
-                tool_result = f"工具调用失败: {exc}"
+            for tc in result:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("arguments", {})
+                yield {"type": "tool_start", "tool": tool_name}
 
-            yield {"type": "tool_result", "tool": tool_name, "result": tool_result}
+                try:
+                    tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
+                except Exception as exc:
+                    tool_result = f"工具调用失败: {exc}"
 
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": result.get("id", "call_1"),
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": json.dumps(tool_args, ensure_ascii=False)},
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": result.get("id", "call_1"),
-                "content": tool_result,
-            })
+                yield {"type": "tool_result", "tool": tool_name, "result": tool_result}
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", "call_1"),
+                    "content": tool_result,
+                })
+                tool_history.append({"role": "tool_result", "content": tool_result})
 
         messages.append({
             "role": "user",
@@ -592,26 +681,36 @@ class Agent:
         })
         full = ""
         try:
-            for token in self._call_provider_stream(messages):
+            async for token in self._provider_stream(messages):
                 full += token
                 yield {"type": "token", "content": token}
         except Exception as exc:
             yield {"type": "error", "content": str(exc)}
             return
         yield {"type": "done", "content": full}
-        self._persist_stream_chat(question, full, timestamp)
+        self._persist_chat(question, full, timestamp, messages, tool_history)
 
-    def _persist_stream_chat(self, question: str, response: str, timestamp: str) -> None:
+    # ------------------------------------------------------------------
+    # Chat persistence
+    # ------------------------------------------------------------------
+
+    def _persist_chat(
+        self,
+        question: str,
+        response: str,
+        timestamp: str,
+        messages: list[dict[str, Any]],
+        tool_history: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Save user question, assistant response, and any tool messages to history."""
         history = self.messages
-        history.extend([
-            {"role": "user", "content": question, "timestamp": timestamp},
-            {"role": "assistant", "content": response, "timestamp": datetime.utcnow().isoformat()},
-        ])
+        history.append({"role": "user", "content": question, "timestamp": timestamp})
+        if tool_history:
+            history.extend(tool_history)
+        history.append({
+            "role": "assistant",
+            "content": response,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
         self._write_messages(history)
 
-
-if __name__ == "__main__":
-    SteamAgent = Agent("system")
-
-    input_question = sys.argv[1]
-    SteamAgent.Call(input_question)

@@ -192,45 +192,60 @@ export default {
       this.state.error.chat = ''
       this.state.error.steam = ''
 
-      try {
-        const [profileRes, messagesRes, overviewRes, dealsRes] = await Promise.allSettled([
-          getProfile(profileId),
-          getProfileMessages(profileId),
-          getSteamOverview(profileId),
-          getSteamDeals(profileId),
-        ])
+      // Load conversation data and Steam data independently.
+      // Conversation (profile + messages) must render immediately;
+      // slow Steam API calls must not block it.
+      const loadConversation = (async () => {
+        try {
+          const [profileRes, messagesRes] = await Promise.allSettled([
+            getProfile(profileId),
+            getProfileMessages(profileId),
+          ])
 
-        if (profileRes.status === 'fulfilled') {
-          this.state.selectedProfile = profileRes.value.data.profile
-        } else {
-          this.state.selectedProfile = null
-          this.state.error.chat = normalizeError(profileRes.reason)
-        }
+          if (profileRes.status === 'fulfilled') {
+            this.state.selectedProfile = profileRes.value.data.profile
+          } else {
+            this.state.selectedProfile = null
+            this.state.error.chat = normalizeError(profileRes.reason)
+          }
 
-        if (messagesRes.status === 'fulfilled') {
-          this.state.messages = messagesRes.value.data.messages || []
-        } else {
-          this.state.messages = []
-          this.state.error.chat = this.state.error.chat || normalizeError(messagesRes.reason)
+          if (messagesRes.status === 'fulfilled') {
+            this.state.messages = messagesRes.value.data.messages || []
+          } else {
+            this.state.messages = []
+            this.state.error.chat = this.state.error.chat || normalizeError(messagesRes.reason)
+          }
+        } finally {
+          this.state.loading.conversation = false
         }
+      })()
 
-        if (overviewRes.status === 'fulfilled') {
-          this.state.steamOverview = overviewRes.value.data || createEmptyOverview()
-        } else {
-          this.state.steamOverview = createEmptyOverview()
-          this.state.error.steam = normalizeError(overviewRes.reason)
-        }
+      const loadSteam = (async () => {
+        try {
+          const [overviewRes, dealsRes] = await Promise.allSettled([
+            getSteamOverview(profileId),
+            getSteamDeals(profileId),
+          ])
 
-        if (dealsRes.status === 'fulfilled') {
-          this.state.steamDeals = dealsRes.value.data || createEmptyDeals()
-        } else {
-          this.state.steamDeals = createEmptyDeals()
-          this.state.error.steam = this.state.error.steam || normalizeError(dealsRes.reason)
+          if (overviewRes.status === 'fulfilled') {
+            this.state.steamOverview = overviewRes.value.data || createEmptyOverview()
+          } else {
+            this.state.steamOverview = createEmptyOverview()
+            this.state.error.steam = normalizeError(overviewRes.reason)
+          }
+
+          if (dealsRes.status === 'fulfilled') {
+            this.state.steamDeals = dealsRes.value.data || createEmptyDeals()
+          } else {
+            this.state.steamDeals = createEmptyDeals()
+            this.state.error.steam = this.state.error.steam || normalizeError(dealsRes.reason)
+          }
+        } finally {
+          this.state.loading.steam = false
         }
-      } finally {
-        this.state.loading.conversation = false
-        this.state.loading.steam = false
-      }
+      })()
+
+      await Promise.all([loadConversation, loadSteam])
     },
     async handleCreateProfile(displayName) {
       this.state.loading.createProfile = true
@@ -326,59 +341,77 @@ export default {
         timestamp,
       })
 
-      // Placeholder for assistant response
-      this.state.messages.push({
+      // Placeholder for assistant response — we track a reference to the
+      // placeholder object so tool-call inserts before it don't invalidate
+      // index-based access in callbacks.
+      const assistantPlaceholder = {
         role: 'assistant',
         content: '',
         timestamp: '',
-      })
-      const assistantIndex = this.state.messages.length - 1
+      }
+      this.state.messages.push(assistantPlaceholder)
+
+      // Track pending tool-result placeholder indices for correct update
+      const pendingToolResults = []
 
       try {
         await sendChatStream(this.state.selectedProfileId, question, 3, {
           onToken: (content) => {
             this.state.streamingContent += content
-            this.state.messages[assistantIndex].content += content
+            assistantPlaceholder.content += content
           },
-          onDone: (fullContent) => {
-            this.state.messages[assistantIndex].content = fullContent
-            this.state.messages[assistantIndex].timestamp = new Date().toISOString()
+          onDone: () => {
+            // Token-by-token accumulation already built the full response.
+            assistantPlaceholder.timestamp = new Date().toISOString()
             this.state.streamingContent = ''
             this.state.loading.sending = false
             this.refreshProfileSummaries(this.state.selectedProfileId)
           },
           onError: (error) => {
-            this.state.messages.splice(assistantIndex, 1)
+            // Remove the assistant placeholder on error
+            const idx = this.state.messages.indexOf(assistantPlaceholder)
+            if (idx !== -1) {
+              this.state.messages.splice(idx, 1)
+            }
             this.state.streamingContent = ''
             this.state.error.chat = error
             this.state.loading.sending = false
           },
           onToolStart: (tool) => {
-            this.state.messages.splice(assistantIndex, 0, {
+            // Insert tool_call and tool_result BEFORE the assistant placeholder
+            const placeholderIdx = this.state.messages.indexOf(assistantPlaceholder)
+            if (placeholderIdx === -1) return
+            this.state.messages.splice(placeholderIdx, 0, {
               role: 'tool_call',
               content: `正在调用: ${tool}`,
               timestamp: new Date().toISOString(),
             })
-            this.state.messages.splice(assistantIndex + 2, 0, {
+            const resultIdx = placeholderIdx + 1
+            this.state.messages.splice(resultIdx, 0, {
               role: 'tool_result',
               content: '等待结果...',
               timestamp: new Date().toISOString(),
             })
+            pendingToolResults.push({ tool, index: resultIdx })
           },
           onToolResult: (tool, result) => {
-            // Find the tool_result message and update it
-            const toolResultMsg = this.state.messages.find(
-              (m) => m.role === 'tool_result' && m.content === '等待结果...'
+            // Update the matching tool_result placeholder by tracked index
+            const entry = pendingToolResults.find(
+              (e) => e.tool === tool &&
+                this.state.messages[e.index]?.content === '等待结果...'
             )
-            if (toolResultMsg) {
-              toolResultMsg.content = result.length > 500
+            if (entry && this.state.messages[entry.index]) {
+              this.state.messages[entry.index].content = result.length > 500
                 ? result.slice(0, 500) + '...'
                 : result
             }
           },
         })
       } catch (error) {
-        this.state.messages.splice(assistantIndex, 1)
+        const idx = this.state.messages.indexOf(assistantPlaceholder)
+        if (idx !== -1) {
+          this.state.messages.splice(idx, 1)
+        }
         this.state.streamingContent = ''
         this.state.error.chat = normalizeError(error)
         this.state.loading.sending = false

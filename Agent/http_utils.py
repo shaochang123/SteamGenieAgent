@@ -1,133 +1,30 @@
 import json
-from typing import Any
-from urllib import error, parse, request
+from typing import Any, AsyncGenerator
+from urllib import parse
+
+import httpx
 
 from config import http_timeout
 
-
-def _decode_error(exc: error.HTTPError) -> str:
-    try:
-        raw = exc.read().decode("utf-8")
-    except Exception:
-        raw = exc.reason if hasattr(exc, "reason") else str(exc)
-
-    if not raw:
-        return f"{exc.code} {exc.reason}"
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-
-    if isinstance(payload, dict):
-        if isinstance(payload.get("error"), dict):
-            message = payload["error"].get("message")
-            if message:
-                return str(message)
-        if payload.get("message"):
-            return str(payload["message"])
-    return raw
+# Module-level async HTTP client singleton for connection reuse
+_async_client: httpx.AsyncClient | None = None
 
 
-def fetch_json(
-    url: str,
-    *,
-    method: str = "GET",
-    payload: Any | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: int = http_timeout,
-    proxy: str | None = None,
-) -> Any:
-    body = None
-    final_headers = {"Accept": "application/json"}
-    if headers:
-        final_headers.update(headers)
-
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-        final_headers.setdefault("Content-Type", "application/json")
-
-    req = request.Request(url, data=body, headers=final_headers, method=method.upper())
-
-    if proxy:
-        proxy_handler = request.ProxyHandler({"http": proxy, "https": proxy})
-        opener = request.build_opener(proxy_handler)
-    else:
-        opener = request.build_opener()
-
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset("utf-8")
-            raw = resp.read().decode(charset)
-            if not raw:
-                return {}
-            return json.loads(raw)
-    except error.HTTPError as exc:
-        raise RuntimeError(_decode_error(exc)) from exc
-    except error.URLError as exc:
-        reason = exc.reason if hasattr(exc, "reason") else str(exc)
-        raise RuntimeError(str(reason)) from exc
+def _get_async_client() -> httpx.AsyncClient:
+    global _async_client
+    if _async_client is None or _async_client.is_closed:
+        _async_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(http_timeout),
+            limits=httpx.Limits(max_connections=20),
+        )
+    return _async_client
 
 
-def fetch_text(
-    url: str,
-    *,
-    method: str = "GET",
-    headers: dict[str, str] | None = None,
-    timeout: int = http_timeout,
-    proxy: str | None = None,
-) -> str:
-    final_headers = {"Accept": "*/*"}
-    if headers:
-        final_headers.update(headers)
-
-    req = request.Request(url, headers=final_headers, method=method.upper())
-
-    if proxy:
-        proxy_handler = request.ProxyHandler({"http": proxy, "https": proxy})
-        opener = request.build_opener(proxy_handler)
-    else:
-        opener = request.build_opener()
-
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset("utf-8")
-            return resp.read().decode(charset)
-    except error.HTTPError as exc:
-        raise RuntimeError(_decode_error(exc)) from exc
-    except error.URLError as exc:
-        reason = exc.reason if hasattr(exc, "reason") else str(exc)
-        raise RuntimeError(str(reason)) from exc
-
-
-def fetch_stream(
-    url: str,
-    *,
-    method: str = "POST",
-    payload: Any | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: int = http_timeout,
-    proxy: str | None = None,
-):
-    """Return a raw urllib response object for line-by-line streaming reads."""
-    body = None
-    final_headers = {}
-    if headers:
-        final_headers.update(headers)
-
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-        final_headers.setdefault("Content-Type", "application/json")
-
-    req = request.Request(url, data=body, headers=final_headers, method=method.upper())
-
-    if proxy:
-        proxy_handler = request.ProxyHandler({"http": proxy, "https": proxy})
-        opener = request.build_opener(proxy_handler)
-    else:
-        opener = request.build_opener()
-
-    return opener.open(req, timeout=timeout)
+async def close_async_client() -> None:
+    global _async_client
+    if _async_client is not None and not _async_client.is_closed:
+        await _async_client.aclose()
+        _async_client = None
 
 
 def append_query(url: str, **params: Any) -> str:
@@ -141,3 +38,128 @@ def append_query(url: str, **params: Any) -> str:
     query = parse.urlencode(filtered)
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}{query}"
+
+
+# ---------------------------------------------------------------------------
+# Async HTTP helpers (httpx-based)
+# ---------------------------------------------------------------------------
+
+
+def _client_for(proxy: str | None = None) -> httpx.AsyncClient:
+    """Return a client.  When *proxy* is given, create a temporary client
+    configured with that proxy; otherwise reuse the module-level singleton."""
+    if proxy:
+        return httpx.AsyncClient(
+            proxy=proxy,
+            timeout=httpx.Timeout(http_timeout),
+        )
+    return _get_async_client()
+
+
+async def async_fetch_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: Any | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = http_timeout,
+    proxy: str | None = None,
+) -> Any:
+    final_headers = {"Accept": "application/json"}
+    if headers:
+        final_headers.update(headers)
+
+    client = _client_for(proxy)
+    try:
+        kwargs: dict[str, Any] = {"headers": final_headers, "timeout": timeout}
+        if payload is not None:
+            kwargs["json"] = payload
+
+        resp = await client.request(method.upper(), url, **kwargs)
+        resp.raise_for_status()
+        raw = resp.text
+        if not raw:
+            return {}
+        return json.loads(raw)
+    finally:
+        if proxy and not client.is_closed:
+            await client.aclose()
+
+
+async def async_fetch_text(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    timeout: int = http_timeout,
+    proxy: str | None = None,
+) -> str:
+    final_headers = {"Accept": "*/*"}
+    if headers:
+        final_headers.update(headers)
+
+    client = _client_for(proxy)
+    try:
+        kwargs: dict[str, Any] = {"headers": final_headers, "timeout": timeout}
+        resp = await client.request(method.upper(), url, **kwargs)
+        resp.raise_for_status()
+        return resp.text
+    finally:
+        if proxy and not client.is_closed:
+            await client.aclose()
+
+
+async def async_fetch_stream(
+    url: str,
+    *,
+    method: str = "POST",
+    payload: Any | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = http_timeout,
+    proxy: str | None = None,
+) -> AsyncGenerator[bytes, None]:
+    final_headers: dict[str, str] = {}
+    if headers:
+        final_headers.update(headers)
+
+    client = _client_for(proxy)
+    try:
+        kwargs: dict[str, Any] = {"headers": final_headers, "timeout": timeout}
+        if payload is not None:
+            kwargs["json"] = payload
+
+        async with client.stream(method.upper(), url, **kwargs) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+    finally:
+        if proxy and not client.is_closed:
+            await client.aclose()
+
+
+async def async_fetch_stream_lines(
+    url: str,
+    *,
+    method: str = "POST",
+    payload: Any | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = http_timeout,
+    proxy: str | None = None,
+) -> AsyncGenerator[str, None]:
+    final_headers: dict[str, str] = {}
+    if headers:
+        final_headers.update(headers)
+
+    client = _client_for(proxy)
+    try:
+        kwargs: dict[str, Any] = {"headers": final_headers, "timeout": timeout}
+        if payload is not None:
+            kwargs["json"] = payload
+
+        async with client.stream(method.upper(), url, **kwargs) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                yield line
+    finally:
+        if proxy and not client.is_closed:
+            await client.aclose()
