@@ -1,0 +1,8 @@
+{
+  "name": "Celeste",
+  "description": "Help Madeline survive her inner demons on her journey to the top of Celeste Mountain, in this super-tight platformer from the creators of TowerFall. Brave hundreds of hand-crafted challenges, uncover devious secrets, and piece together the mystery of the mountain.",
+  "requirements": "<strong>Minimum:</strong><br><ul class=\"bb_ul\"><li><strong>OS *:</strong> Windows 7 or newer<br></li><li><strong>Processor:</strong> Intel Core i3 M380<br></li><li><strong>Memory:</strong> 2 GB RAM<br></li><li><strong>Graphics:</strong> Intel HD 4000<br></li><li><strong>DirectX:</strong> Version 10<br></li><li><strong>Storage:</strong> 1200 MB available space</li></ul>",
+  "comment1": "Great game. Has a native linux port. I love that! \r\n\r\nIf you are on debian make sure to install steam from the steam website / .deb file. not from the debian apt repo. Otherwise  the game won't launch because of steam path issues. Once I figured that out it runs flawlessly",
+  "comment2": "actually the perfect game for people who do NOT crash out easily, and are super bad at platformers. if you fit that criteria, i believe that this would be the perfect game for you sire......",
+  "comment3": "This is my favourite game of all time. Nothing makes me feel a greater sense of accomplishment more than completing a hard room. 7c and Farewell last room took me so long that my muscle memory for the movements genuinely might be permanently etched in my brain forever. \n\nThank you Celeste. Thank you Maddy Makes Games. Thank you Maddy Thorson."
+}
