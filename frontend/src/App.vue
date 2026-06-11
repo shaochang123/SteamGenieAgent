@@ -425,6 +425,8 @@ export default {
       this.state.loading.steam = true
       this.state.error.steam = ''
       try {
+        // Steam overview and deals are independent cards. allSettled lets one
+        // card show data even if the other API fails.
         const [overviewRes, dealsRes] = await Promise.allSettled([
           getSteamOverview(this.state.selectedProfileId),
           getSteamDeals(this.state.selectedProfileId),

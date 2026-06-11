@@ -65,6 +65,7 @@ async def async_fetch_json(
     timeout: int = http_timeout,
     proxy: str | None = None,
 ) -> Any:
+    """Fetch JSON with shared connection pooling unless a per-request proxy is used."""
     final_headers = {"Accept": "application/json"}
     if headers:
         final_headers.update(headers)
@@ -94,6 +95,7 @@ async def async_fetch_text(
     timeout: int = http_timeout,
     proxy: str | None = None,
 ) -> str:
+    """Fetch plain text for APIs that do not return JSON."""
     final_headers = {"Accept": "*/*"}
     if headers:
         final_headers.update(headers)
@@ -109,34 +111,6 @@ async def async_fetch_text(
             await client.aclose()
 
 
-async def async_fetch_stream(
-    url: str,
-    *,
-    method: str = "POST",
-    payload: Any | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: int = http_timeout,
-    proxy: str | None = None,
-) -> AsyncGenerator[bytes, None]:
-    final_headers: dict[str, str] = {}
-    if headers:
-        final_headers.update(headers)
-
-    client = _client_for(proxy)
-    try:
-        kwargs: dict[str, Any] = {"headers": final_headers, "timeout": timeout}
-        if payload is not None:
-            kwargs["json"] = payload
-
-        async with client.stream(method.upper(), url, **kwargs) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-    finally:
-        if proxy and not client.is_closed:
-            await client.aclose()
-
-
 async def async_fetch_stream_lines(
     url: str,
     *,
@@ -146,6 +120,7 @@ async def async_fetch_stream_lines(
     timeout: int = http_timeout,
     proxy: str | None = None,
 ) -> AsyncGenerator[str, None]:
+    """Yield streamed response lines for Ollama and OpenAI-compatible SSE."""
     final_headers: dict[str, str] = {}
     if headers:
         final_headers.update(headers)

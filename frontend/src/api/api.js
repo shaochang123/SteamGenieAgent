@@ -42,14 +42,6 @@ export function getProfileMessages(profileId) {
   return api.get(`/profiles/${profileId}/messages`)
 }
 
-export function sendChat(profileId, question, k = 3) {
-  return api.post('/chat', {
-    profileId,
-    question,
-    k,
-  })
-}
-
 export function getSteamOverview(profileId) {
   return api.get(`/profiles/${profileId}/steam/overview`)
 }
@@ -74,6 +66,8 @@ export function deleteKnowledge(profileId, filename) {
   return api.delete(`/profiles/${profileId}/knowledge/${encodeURIComponent(filename)}`)
 }
 
+// Axios does not expose browser ReadableStream chunks consistently, so the
+// streaming chat endpoint uses fetch and dispatches parsed SSE events manually.
 export async function sendChatStream(profileId, question, k, callbacks) {
   const baseURL = process.env.VUE_APP_API_BASE_URL || 'http://127.0.0.1:8000'
   const { onToken, onDone, onError, onToolStart, onToolResult } = callbacks
@@ -108,6 +102,8 @@ export async function sendChatStream(profileId, question, k, callbacks) {
       if (done) { reading = false; break }
       buffer += decoder.decode(value, { stream: true })
 
+      // Network chunks can split in the middle of an SSE line. Keep the final
+      // partial line in buffer until the next chunk arrives.
       const lines = buffer.split('\n')
       buffer = lines.pop() || ''
 

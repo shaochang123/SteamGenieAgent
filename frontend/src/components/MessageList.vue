@@ -33,10 +33,26 @@
 <script>
 import MarkdownIt from 'markdown-it'
 
+// Messages are rendered with v-html after Markdown conversion. Raw HTML stays
+// disabled here, and links are forced into isolated new tabs below.
 const markdown = new MarkdownIt({
+  html: false,
   breaks: true,
   linkify: true,
 })
+
+const defaultLinkOpen =
+  markdown.renderer.rules.link_open ||
+  function renderLinkOpen(tokens, idx, options, env, self) {
+    return self.renderToken(tokens, idx, options)
+  }
+
+markdown.renderer.rules.link_open = function safeLinkOpen(tokens, idx, options, env, self) {
+  const token = tokens[idx]
+  token.attrSet('target', '_blank')
+  token.attrSet('rel', 'noopener noreferrer')
+  return defaultLinkOpen(tokens, idx, options, env, self)
+}
 
 export default {
   name: 'MessageList',

@@ -25,10 +25,12 @@ from config import (
 
 
 def utc_now() -> str:
+    """Return a timezone-aware timestamp for profile and history metadata."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def slugify(value: str) -> str:
+    """Create a stable local profile id from a user-visible display name."""
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "profile"
 
@@ -42,6 +44,7 @@ class ProfileStore:
         self.ensure_layout()
 
     def ensure_layout(self) -> None:
+        """Create the runtime directory tree and import any old local data."""
         self.runtime_path.mkdir(parents=True, exist_ok=True)
         self.profiles_path.mkdir(parents=True, exist_ok=True)
         self.history_path.mkdir(parents=True, exist_ok=True)
@@ -50,6 +53,7 @@ class ProfileStore:
         self._migrate_legacy_data()
 
     def _migrate_legacy_data(self) -> None:
+        """Move pre-runtime history/vector files forward without deleting them."""
         if legacy_history_path.exists():
             for legacy_file in Path(legacy_history_path).iterdir():
                 if not legacy_file.is_file():
@@ -78,6 +82,7 @@ class ProfileStore:
             shutil.copy2(legacy_md5, runtime_md5)
 
     def _default_profile(self, profile_id: str, display_name: str) -> dict[str, Any]:
+        """Build a new profile with non-sensitive defaults only."""
         timestamp = utc_now()
         return {
             "id": profile_id,
@@ -123,6 +128,7 @@ class ProfileStore:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
 
     def list_profiles(self) -> list[dict[str, Any]]:
+        """Return lightweight profile summaries for the sidebar."""
         profiles: list[dict[str, Any]] = []
         for path in sorted(self.profiles_path.glob("*.json")):
             profile = self._read_json(path, None)
@@ -179,12 +185,19 @@ class ProfileStore:
     def delete_profile(self, profile_id: str) -> None:
         profile_path = self.profile_path(profile_id)
         history_file = self.history_file_path(profile_id)
+        knowledge_dir = Path(user_knowledge_path) / profile_id
+        profile_md5_file = Path(md5_path).parent / "md5" / f"{profile_id}.txt"
 
         if not profile_path.exists():
             raise FileNotFoundError("用户不存在。")
 
+        # A profile owns several runtime sidecars. Remove them together so a
+        # recreated user does not inherit old history, uploads, or md5 markers.
         profile_path.unlink(missing_ok=True)
         history_file.unlink(missing_ok=True)
+        if knowledge_dir.exists():
+            shutil.rmtree(knowledge_dir)
+        profile_md5_file.unlink(missing_ok=True)
 
     def update_profile_config(
         self,
@@ -193,6 +206,7 @@ class ProfileStore:
         ai: dict[str, Any] | None = None,
         steam: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Merge partial settings updates without resetting unrelated sections."""
         profile = self.get_profile(profile_id)
 
         if ai:
@@ -238,6 +252,7 @@ class ProfileStore:
         return profile
 
     def load_messages(self, profile_id: str) -> list[dict[str, Any]]:
+        """Load one profile's chat history and normalize legacy message shapes."""
         raw_messages = self._read_json(self.history_file_path(profile_id), [])
         normalized: list[dict[str, Any]] = []
         if not isinstance(raw_messages, list):
@@ -286,6 +301,10 @@ class ProfileStore:
         dir_path.mkdir(parents=True, exist_ok=True)
         return dir_path
 
+    def _knowledge_file_path(self, profile_id: str, filename: str) -> Path:
+        safe_name = filename.replace("\\", "/").split("/")[-1]
+        return self.knowledge_dir(profile_id) / safe_name
+
     def list_knowledge_files(self, profile_id: str) -> dict[str, list[dict[str, Any]]]:
         public_files: list[dict[str, Any]] = []
         public_dir = Path(__import__("config").knowledge_path)
@@ -306,32 +325,27 @@ class ProfileStore:
         return {"public": public_files, "user": user_files}
 
     def save_knowledge_file(self, profile_id: str, filename: str, content: bytes) -> Path:
+        # Only keep the basename from the browser-provided filename. This blocks
+        # path traversal while still preserving the user's visible file name.
         safe_name = filename.replace("\\", "/").split("/")[-1]
+        if not safe_name or safe_name in {".", ".."} or len(safe_name) > 160:
+            raise ValueError("文件名不合法。")
+        if any(char in safe_name for char in '<>:"|?*'):
+            raise ValueError("文件名包含不支持的字符。")
         if not safe_name.lower().endswith(".json"):
             raise ValueError("仅支持 .json 文件。")
-        target = self.knowledge_dir(profile_id) / safe_name
+        target = self._knowledge_file_path(profile_id, safe_name)
         target.write_bytes(content)
         return target
 
+    def read_knowledge_file(self, profile_id: str, filename: str) -> str:
+        target = self._knowledge_file_path(profile_id, filename)
+        if not target.exists():
+            raise FileNotFoundError("文件不存在。")
+        return target.read_text(encoding="utf-8")
+
     def delete_knowledge_file(self, profile_id: str, filename: str) -> None:
-        safe_name = filename.replace("\\", "/").split("/")[-1]
-        target = self.knowledge_dir(profile_id) / safe_name
+        target = self._knowledge_file_path(profile_id, filename)
         if not target.exists():
             raise FileNotFoundError("文件不存在。")
         target.unlink()
-
-    def append_chat_exchange(self, profile_id: str, question: str, answer: str) -> list[dict[str, Any]]:
-        timestamp = utc_now()
-        messages = self.load_messages(profile_id)
-        messages.extend(
-            [
-                {"role": "user", "content": question, "timestamp": timestamp},
-                {"role": "assistant", "content": answer, "timestamp": utc_now()},
-            ]
-        )
-        self.save_messages(profile_id, messages)
-
-        profile = self.get_profile(profile_id)
-        profile["updatedAt"] = utc_now()
-        self._write_json(self.profile_path(profile_id), profile)
-        return messages
