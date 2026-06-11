@@ -23,6 +23,7 @@ export const appStore = Vue.observable({
   selectedProfileId: '',
   selectedProfile: null,
   messages: [],
+  streamingContent: '',
   steamOverview: createEmptyOverview(),
   steamDeals: createEmptyDeals(),
   dialogs: {

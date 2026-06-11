@@ -2,6 +2,8 @@
 
 Local Steam AI workspace with a Vue 2 dashboard, a FastAPI backend, per-user memory, and Steam profile/store cards.
 
+Watch [INSTALL](./INSTALL.md) to configure the project
+
 **English** | [中文说明](./README_CN.md)
 
 ## What this repo is now
@@ -82,114 +84,6 @@ Ignored paths include:
 - `.codex/`
 
 That keeps API keys, Steam identifiers, histories, and local caches out of commits by default.
-
-## Quick start
-
-### 1. Backend requirements
-
-Recommended:
-
-- Python 3.10+
-- [Ollama](https://ollama.com/) if you want to use the default local provider or build local embeddings
-
-Install backend dependencies in your own environment:
-
-```bash
-pip install fastapi uvicorn langchain-chroma langchain-core langchain-ollama langchain-text-splitters
-```
-
-If you plan to use the default local models, pull them first:
-
-```bash
-ollama pull qwen3:8b
-ollama pull qwen3-embedding:4b
-```
-
-### 2. Frontend requirements
-
-- Node.js 18+
-
-Install frontend dependencies:
-
-```bash
-cd frontend
-npm install
-```
-
-### 3. Start the backend
-
-From the repository root:
-
-```bash
-python Agent/server.py
-```
-
-The API listens on:
-
-```text
-http://127.0.0.1:8000
-```
-
-### 4. Start the frontend
-
-In a second terminal:
-
-```bash
-cd frontend
-npm run serve
-```
-
-The UI runs on:
-
-```text
-http://127.0.0.1:8080
-```
-
-### 5. Open the app
-
-1. Create a local user
-2. Open `Settings`
-3. Pick exactly one AI provider
-4. Optionally add `Steam API Key` and `SteamID64`
-5. Start chatting
-
-## Configuration model
-
-Each user profile stores two sections:
-
-### AI
-
-- `provider`
-  - `ollama`
-  - `openai-compatible`
-- `ollama.baseUrl`
-- `ollama.model`
-- `openaiCompatible.apiKey`
-- `openaiCompatible.baseUrl`
-- `openaiCompatible.model`
-
-### Steam
-
-- `apiKey`
-- `steamId`
-- `country`
-- `language`
-
-Defaults are defined in [Agent/config.py](./Agent/config.py).
-
-## Optional knowledge indexing
-
-If you want retrieval over the local JSON files in `Agent/Knowledge/`:
-
-```bash
-python Agent/build_vector_db.py
-```
-
-Notes:
-
-- The index is written to `Agent/runtime/vector/`
-- Duplicate content is skipped using `Agent/runtime/md5.txt`
-- Retrieval errors do not block chat; the app falls back to direct conversation
 
 ## HTTP API
 
