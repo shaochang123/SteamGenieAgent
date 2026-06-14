@@ -15,7 +15,9 @@ __pycache__
 *.sqlite3
 test
 frontend/.env*
+Agent/venv/
 Agent/runtime/
 Agent/ChatHisTory/
 Agent/ChatDB/
 Agent/md5.txt
+llama.cpp/

@@ -1,8 +1,12 @@
 import json
+import urllib3
 from typing import Any, AsyncGenerator
 from urllib import parse
 
 import httpx
+
+# —— 抑制 verify=False 时的 SSL 警告 ——
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from config import http_timeout
 
@@ -16,6 +20,8 @@ def _get_async_client() -> httpx.AsyncClient:
         _async_client = httpx.AsyncClient(
             timeout=httpx.Timeout(http_timeout),
             limits=httpx.Limits(max_connections=20),
+            trust_env=False,
+            verify=False,       # 避免 SSL 证书验证问题
         )
     return _async_client
 
@@ -52,6 +58,8 @@ def _client_for(proxy: str | None = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             proxy=proxy,
             timeout=httpx.Timeout(http_timeout),
+            trust_env=False,
+            verify=False,
         )
     return _get_async_client()
 

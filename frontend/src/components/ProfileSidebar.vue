@@ -23,7 +23,7 @@
           <strong>{{ profile.displayName }}</strong>
           <span class="profile-card__badge">{{ providerLabel(profile.provider) }}</span>
         </div>
-        <p>{{ Math.floor(profile.messageCount / 2) }} 条消息</p>
+        <p>{{ Math.floor((profile.messageCount || 0) / 2) }} 条消息</p>
         <div class="profile-card__meta">
           <span :class="profile.hasAiConfig ? 'ok' : 'warn'">
             {{ profile.hasAiConfig ? 'AI 已配置' : 'AI 待配置' }}

@@ -7,7 +7,6 @@
       rows="1"
       placeholder="给 AI 发送一条消息..."
       @keydown.enter.exact.prevent="submit"
-      @keydown.enter.shift.exact.stop
     ></textarea>
 
     <button class="composer__button" type="submit" :disabled="disabled || !draft">

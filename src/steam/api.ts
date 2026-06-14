@@ -1,5 +1,6 @@
 // ============================================================================
-// Steam Web API Client
+// Steam Web API Client — with proxy support via native https module
+// (Node's built-in fetch/undici is incompatible with HttpsProxyAgent)
 // ============================================================================
 
 import type {
@@ -9,35 +10,63 @@ import type {
   StoreAppDetails,
   CountryPrice,
 } from "../types.js";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import * as https from "node:https";
+import * as http from "node:http";
 
 const STEAM_API_BASE = "https://api.steampowered.com";
 const STEAM_STORE_BASE = "https://store.steampowered.com";
 
-// Node.js built-in fetch (undici-based) does NOT respect HTTP_PROXY env vars.
-// Build a shared ProxyAgent when a proxy is configured.
-let _proxyDispatcher: any = undefined;
-function _initProxy(): void {
-  if (_proxyDispatcher !== undefined) return;
-  const proxyUrl =
-    process.env.HTTP_PROXY || process.env.HTTPS_PROXY || "";
+let _proxyAgent: HttpsProxyAgent<string> | null | undefined = undefined;
+function _getProxyAgent(): HttpsProxyAgent<string> | null {
+  if (_proxyAgent !== undefined) return _proxyAgent;
+  const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || "";
   if (!proxyUrl) {
-    _proxyDispatcher = null; // sentinel: no proxy
-    return;
+    _proxyAgent = null;
+    return null;
   }
   try {
-    // undici is available as a built-in in Node 18+
-    const { ProxyAgent } = require("undici") as typeof import("undici");
-    _proxyDispatcher = new ProxyAgent(proxyUrl);
+    _proxyAgent = new HttpsProxyAgent(proxyUrl);
+    return _proxyAgent;
   } catch {
-    _proxyDispatcher = null;
+    _proxyAgent = null;
+    return null;
   }
 }
 
-function _fetchOptions(): Record<string, unknown> {
-  _initProxy();
-  if (_proxyDispatcher) return { dispatcher: _proxyDispatcher };
-  return {};
+/** Fetch JSON via native https/http module (works with HttpsProxyAgent). */
+async function _fetchWithProxy(url: string, timeout = 15000): Promise<string> {
+  const u = new URL(url);
+  const isHttps = u.protocol === "https:";
+  const mod = isHttps ? https : http;
+  const agent = _getProxyAgent();
+  const headers: Record<string, string> = { Accept: "application/json" };
+
+  return new Promise((resolve, reject) => {
+    const req = mod.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      agent: agent || undefined,
+      headers,
+      timeout,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => data += chunk.toString());
+      res.on("end", () => {
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`Steam API returned ${res.statusCode}`));
+        } else {
+          resolve(data);
+        }
+      });
+    });
+    req.on("error", (e: Error) => reject(new Error(`fetch failed: ${e.message}`)));
+    req.on("timeout", () => { req.destroy(); reject(new Error("fetch timeout")); });
+    req.end();
+  });
 }
+
+export { _getProxyAgent };
 
 export class SteamApiClient {
   readonly apiKey: string;
@@ -59,11 +88,8 @@ export class SteamApiClient {
   // ---- HTTP Helpers ----
 
   private async fetchJson<T>(url: string): Promise<T> {
-    const resp = await fetch(url, _fetchOptions());
-    if (!resp.ok) {
-      throw new Error(`Steam API returned ${resp.status}: ${resp.statusText}`);
-    }
-    return resp.json() as Promise<T>;
+    const text = await _fetchWithProxy(url);
+    return JSON.parse(text) as T;
   }
 
   private apiUrl(iface: string, method: string, version: string, params: Record<string, string> = {}): string {
@@ -225,11 +251,10 @@ export class SteamApiClient {
     language = "zh-CN"
   ): Promise<string> {
     try {
-      const resp = await fetch(
-        `${STEAM_STORE_BASE}/api/appdetails?appids=${appid}&cc=${country}&l=${language}`,
-        _fetchOptions()
+      const text = await _fetchWithProxy(
+        `${STEAM_STORE_BASE}/api/appdetails?appids=${appid}&cc=${country}&l=${language}`
       );
-      const data = (await resp.json()) as Record<
+      const data = JSON.parse(text) as Record<
         string,
         { success: boolean; data: { short_description: string } }
       >;
@@ -244,11 +269,10 @@ export class SteamApiClient {
   /** Get all prices for a game across all regions */
   async getAppPriceInfo(appid: number): Promise<Record<string, CountryPrice>> {
     try {
-      const resp = await fetch(
-        `https://store.steampowered.com/api/appdetails?appids=${appid}&filters=price_overview`,
-        _fetchOptions()
+      const text = await _fetchWithProxy(
+        `https://store.steampowered.com/api/appdetails?appids=${appid}&filters=price_overview`
       );
-      const data = (await resp.json()) as Record<string, { success: boolean; data: { price_overview: CountryPrice } }>;
+      const data = JSON.parse(text) as Record<string, { success: boolean; data: { price_overview: CountryPrice } }>;
       const entry = data[String(appid)];
       if (!entry?.success) return {};
       return { CN: entry.data.price_overview };

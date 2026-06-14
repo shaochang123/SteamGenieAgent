@@ -3,6 +3,40 @@
 // ============================================================================
 
 import type { MarketPrice, PriceHistoryEntry } from "../types.js";
+import { _getProxyAgent } from "./api.js";
+import * as https from "node:https";
+import * as http from "node:http";
+
+/** Fetch raw text via native https/http (compatible with HttpsProxyAgent). */
+async function _fetchText(url: string, timeout = 15000): Promise<string> {
+  const u = new URL(url);
+  const mod = u.protocol === "https:" ? https : http;
+  const agent = _getProxyAgent();
+  const headers: Record<string, string> = { Accept: "*/*" };
+
+  return new Promise((resolve, reject) => {
+    const req = mod.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      agent: agent || undefined,
+      headers,
+      timeout,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => data += chunk.toString());
+      res.on("end", () => {
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}`));
+        } else {
+          resolve(data);
+        }
+      });
+    });
+    req.on("error", (e: Error) => reject(new Error(`fetch failed: ${e.message}`)));
+    req.on("timeout", () => { req.destroy(); reject(new Error("fetch timeout")); });
+    req.end();
+  });
+}
 
 /** Cache TTLs in milliseconds */
 const CACHE_TTL = {
@@ -50,8 +84,8 @@ export class SteamMarketService {
     const url = `https://steamcommunity.com/market/priceoverview/?appid=${appid}&currency=${this.getCurrencyCode()}&market_hash_name=${encodeURIComponent(marketHashName)}`;
 
     try {
-      const resp = await fetch(url);
-      const data = (await resp.json()) as {
+      const raw = await _fetchText(url);
+      const data = JSON.parse(raw) as {
         success: boolean;
         lowest_price?: string;
         median_price?: string;
@@ -104,8 +138,8 @@ export class SteamMarketService {
     const url = `https://steamcommunity.com/inventory/${id64}/${appid}/${contextId}?l=english&count=5000`;
 
     try {
-      const resp = await fetch(url);
-      const data = (await resp.json()) as {
+      const raw = await _fetchText(url);
+      const data = JSON.parse(raw) as {
         success: boolean;
         assets?: Array<{
           assetid: string;
@@ -163,8 +197,8 @@ export class SteamMarketService {
 
     try {
       const storeUrl = `https://store.steampowered.com/api/appdetails?appids=${appid}&cc=CN&filters=price_overview`;
-      const resp = await fetch(storeUrl);
-      const data = (await resp.json()) as Record<
+      const raw = await _fetchText(storeUrl);
+      const data = JSON.parse(raw) as Record<
         string,
         {
           success: boolean;
@@ -225,8 +259,8 @@ export class SteamMarketService {
     const url = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(query)}&cc=${country}&l=${language}`;
 
     try {
-      const resp = await fetch(url);
-      const data = (await resp.json()) as {
+      const raw = await _fetchText(url);
+      const data = JSON.parse(raw) as {
         success: boolean;
         total: number;
         items: Array<{ id: number; name: string; tiny_image: string }>;
@@ -275,8 +309,8 @@ export class SteamMarketService {
     const url = `https://store.steampowered.com/api/featuredcategories/?cc=${country}&l=${language}`;
 
     try {
-      const resp = await fetch(url);
-      const data = (await resp.json()) as {
+      const raw = await _fetchText(url);
+      const data = JSON.parse(raw) as {
         specials?: {
           items: Array<{
             id: number;
