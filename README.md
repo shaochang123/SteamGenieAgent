@@ -1,4 +1,4 @@
-# SteamGenieMcp
+# SteamGenieAgent
 
 Local Steam AI workspace with a Vue 2 dashboard, a FastAPI backend, per-user memory, and Steam profile/store cards.
 
