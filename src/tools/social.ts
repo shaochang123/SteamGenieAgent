@@ -1,11 +1,9 @@
-// ============================================================================
-// Social Tools — friend management, co-op game finding, invites
-// ============================================================================
-
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SteamApiClient } from "../steam/api.js";
 import type { SteamFriend } from "../types.js";
+import { formatHours } from "./format.js";
+import { textResult } from "./response.js";
 
 const PERSONA_STATE: Record<number, string> = {
   0: "离线",
@@ -18,12 +16,28 @@ const PERSONA_STATE: Record<number, string> = {
 };
 
 const COOP_CATEGORY_IDS = [1, 9, 24, 27, 29, 38, 49]; // Multi-player, Co-op, Online Co-op, etc.
+const isOnline = (friend: SteamFriend): boolean => friend.personastate !== 0;
+const isPlaying = (friend: SteamFriend): boolean => Boolean(friend.gameextrainfo);
+
+function compareFriends(a: SteamFriend, b: SteamFriend): number {
+  if (isOnline(a) && !isOnline(b)) return -1;
+  if (!isOnline(a) && isOnline(b)) return 1;
+  if (isPlaying(a) && !isPlaying(b)) return -1;
+  if (!isPlaying(a) && isPlaying(b)) return 1;
+  return (a.personaname || "").localeCompare(b.personaname || "");
+}
+
+function formatFriendLine(friend: SteamFriend): string {
+  const status = PERSONA_STATE[friend.personastate || 0] || "未知";
+  const playing = friend.gameextrainfo ? ` | 🎮 ${friend.gameextrainfo}` : "";
+  const online = isOnline(friend) ? "🟢" : "⚫";
+  return `- ${online} **${friend.personaname || friend.steamid}** — ${status}${playing}`;
+}
 
 export function registerSocialTools(
   server: McpServer,
   api: SteamApiClient
 ) {
-  // ---- get_friend_list ----
   server.tool(
     "get_friend_list",
     "查看 Steam 好友列表及在线状态，包括正在玩的游戏。",
@@ -38,57 +52,27 @@ export function registerSocialTools(
       const friends = await api.getEnrichedFriends();
 
       if (friends.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "好友列表为空或需要配置 Steam API Key。\n请设置环境变量 STEAM_API_KEY 和 STEAM_ID。",
-            },
-          ],
-        };
+        return textResult(
+          "好友列表为空或需要配置 Steam API Key。\n请设置环境变量 STEAM_API_KEY 和 STEAM_ID。"
+        );
       }
 
-      const filtered = online_only
-        ? friends.filter((f) => f.personastate !== 0)
-        : friends;
+      const filtered = online_only ? friends.filter(isOnline) : friends;
 
-      const online = friends.filter((f) => f.personastate !== 0);
-      const playing = friends.filter((f) => f.gameextrainfo);
+      const online = friends.filter(isOnline);
+      const playing = friends.filter(isPlaying);
 
-      const lines = filtered
-        .sort((a, b) => {
-          if (a.personastate !== 0 && b.personastate === 0) return -1;
-          if (a.personastate === 0 && b.personastate !== 0) return 1;
-          if (a.gameextrainfo && !b.gameextrainfo) return -1;
-          if (!a.gameextrainfo && b.gameextrainfo) return 1;
-          return (a.personaname || "").localeCompare(b.personaname || "");
-        })
-        .map((f) => {
-          const status = PERSONA_STATE[f.personastate || 0] || "未知";
-          const playing = f.gameextrainfo
-            ? ` | 🎮 ${f.gameextrainfo}`
-            : "";
-          const online = f.personastate !== 0 ? "🟢" : "⚫";
-          return `- ${online} **${f.personaname || f.steamid}** — ${status}${playing}`;
-        });
+      const lines = filtered.sort(compareFriends).map(formatFriendLine);
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `👥 **Steam 好友** (${filtered.length} 人)
+      return textResult(`👥 **Steam 好友** (${filtered.length} 人)
 🟢 在线: ${online.length} | 🎮 游戏中: ${playing.length}
 
 ${lines.join("\n")}
 
-💡 使用 find_shared_games 查找你们共有的游戏。`,
-          },
-        ],
-      };
+💡 使用 find_shared_games 查找你们共有的游戏。`);
     }
   );
 
-  // ---- find_shared_games ----
   server.tool(
     "find_shared_games",
     "查找你和指定好友共同拥有的游戏。",
@@ -107,68 +91,44 @@ ${lines.join("\n")}
         .default(30)
         .describe("返回数量上限"),
     },
-    async ({ friend_steam_id, coop_only, limit }) => {
+    async ({ friend_steam_id, limit }) => {
       const myGames = await api.getOwnedGames();
       if (myGames.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "无法获取你的游戏库。请配置 Steam API Key。",
-            },
-          ],
-        };
+        return textResult("无法获取你的游戏库。请配置 Steam API Key。");
       }
 
       const friendApi = new SteamApiClient(api.apiKey, friend_steam_id);
       const friendGames = await friendApi.getOwnedGames();
 
       if (friendGames.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `无法获取好友 ${friend_steam_id} 的游戏库。请确保好友的 Steam 库存设置为公开。`,
-            },
-          ],
-        };
+        return textResult(
+          `无法获取好友 ${friend_steam_id} 的游戏库。请确保好友的 Steam 库存设置为公开。`
+        );
       }
 
       const myAppIds = new Set(myGames.map((g) => g.appid));
       const shared = friendGames.filter((g) => myAppIds.has(g.appid));
 
-      // Sort by combined playtime
-      const myPlaytime = new Map(myGames.map((g) => [g.appid, g.playtime_forever]));
+      const myPlaytime = new Map(
+        myGames.map((g) => [g.appid, g.playtime_forever])
+      );
       shared.sort(
         (a, b) =>
           (b.playtime_forever + (myPlaytime.get(b.appid) || 0)) -
           (a.playtime_forever + (myPlaytime.get(a.appid) || 0))
       );
 
-      const lines = shared.slice(0, limit).map((g) => {
-        const myHrs = Math.round(((myPlaytime.get(g.appid) || 0) / 60) * 10) / 10;
-        const friendHrs =
-          Math.round((g.playtime_forever / 60) * 10) / 10;
-        return `- **${g.name}** (AppID: ${g.appid})
-  你的时长: ${myHrs}h | 好友时长: ${friendHrs}h`;
-      });
+      const lines = shared.slice(0, limit).map((g) => `- **${g.name}** (AppID: ${g.appid})
+  你的时长: ${formatHours(myPlaytime.get(g.appid) || 0)}h | 好友时长: ${formatHours(g.playtime_forever)}h`);
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `🎮 **共同游戏** (${shared.length} 款，显示前 ${Math.min(limit, shared.length)} 款)
+      return textResult(`🎮 **共同游戏** (${shared.length} 款，显示前 ${Math.min(limit, shared.length)} 款)
 
 ${lines.join("\n")}
 
-💡 使用 launch_game 启动游戏，使用 generate_invite 生成邀请语。`,
-          },
-        ],
-      };
+💡 使用 launch_game 启动游戏，使用 generate_invite 生成邀请语。`);
     }
   );
 
-  // ---- find_coop_game ----
   server.tool(
     "find_coop_game",
     "找出你与当前在线好友都能玩的合作游戏，并返回推荐列表。",
@@ -184,33 +144,17 @@ ${lines.join("\n")}
         .default(2)
         .describe("最少需要几个好友拥有该游戏"),
     },
-    async ({ max_players, min_shared_count }) => {
+    async () => {
       const friends = await api.getEnrichedFriends();
-      const onlineFriends = friends.filter(
-        (f) => f.personastate !== 0 && f.personastate !== undefined
-      );
+      const onlineFriends = friends.filter((f) => isOnline(f) && f.personastate !== undefined);
 
       if (onlineFriends.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "当前没有在线好友。",
-            },
-          ],
-        };
+        return textResult("当前没有在线好友。");
       }
 
       const myGames = await api.getOwnedGames();
       if (myGames.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "无法获取游戏库。",
-            },
-          ],
-        };
+        return textResult("无法获取游戏库。");
       }
 
       // Recommend multiplayer/co-op games from the user's library
@@ -221,8 +165,11 @@ ${lines.join("\n")}
         .sort((a, b) => b.playtime_forever - a.playtime_forever)
         .slice(0, 20);
 
-      // Get store data to check for co-op tags
-      const coopCandidates: Array<{ name: string; appid: number; yourPlaytime: number }> = [];
+      const coopCandidates: Array<{
+        name: string;
+        appid: number;
+        yourPlaytime: number;
+      }> = [];
       for (const game of candidates) {
         const details = await api.getStoreAppDetails(game.appid);
         if (!details) continue;
@@ -241,30 +188,21 @@ ${lines.join("\n")}
 
       const yourPlaylist = coopCandidates.slice(0, 12);
 
-      const lines = yourPlaylist.map((g, i) => {
-        const hrs = Math.round((g.yourPlaytime / 60) * 10) / 10;
-        return `${i + 1}. **${g.name}** (AppID: ${g.appid}) — 你的时长: ${hrs}h`;
-      });
+      const lines = yourPlaylist.map(
+        (g, i) => `${i + 1}. **${g.name}** (AppID: ${g.appid}) — 你的时长: ${formatHours(g.yourPlaytime)}h`
+      );
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `🎯 **推荐合作游戏** (从你的游戏库中筛选)
+      return textResult(`🎯 **推荐合作游戏** (从你的游戏库中筛选)
 🟢 在线好友: ${onlineFriends.length} 人
 
 ${lines.join("\n")}
 
 ⚠️ 注意：由于 API 限制，本功能基于你的游戏库筛选多人合作游戏。建议联系好友确认他们是否拥有这些游戏。
 
-💡 使用 find_shared_games 查看与特定好友的共同游戏。`,
-          },
-        ],
-      };
+💡 使用 find_shared_games 查看与特定好友的共同游戏。`);
     }
   );
 
-  // ---- generate_invite ----
   server.tool(
     "generate_invite",
     "生成一段风趣的 Steam 游戏邀请语，用于发送给好友。",
@@ -290,9 +228,7 @@ ${lines.join("\n")}
             `${friend_name}！紧急通知！📢\n据可靠消息，${game_name} 里的 NPC 们正在罢工，要求见到 ${friend_name} 本尊。\n快上线平息这场骚乱！`,
             `哈喽 ${friend_name}！\n检测到你的库存中存在未体验的快乐——《${game_name}》。\n该快乐的保质期即将在无聊中过期，速来领取！🕹️`,
           ],
-          serious: [
-            `${friend_name}，\n\n我准备开始玩《${game_name}》，这款游戏评价很高，我认为你会感兴趣。\n\n如果你有空的话，我们可以一起联机。期待你的回复。`,
-          ],
+          serious: [`${friend_name}，\n\n我准备开始玩《${game_name}》，这款游戏评价很高，我认为你会感兴趣。\n\n如果你有空的话，我们可以一起联机。期待你的回复。`],
           casual: [
             `Hey ${friend_name}，要不要一起玩 ${game_name}？最近想试试这个游戏，看你也在线～`,
             `${friend_name} 在不？来打 ${game_name} 吧，正好都闲着 😄`,
@@ -307,28 +243,17 @@ ${lines.join("\n")}
             `Hey ${friend_name}! 🎮\nMy copy of ${game_name} is gathering dust and starting to give me puppy eyes. Save this poor game with me!`,
             `${friend_name}! URGENT! 📢\nThe NPCs in ${game_name} have unionized and are demanding your presence. Don't cross the picket line — join me!`,
           ],
-          serious: [
-            `Hi ${friend_name},\n\nI'm about to start playing ${game_name} and thought you might enjoy joining. Let me know if you're interested.`,
-          ],
-          casual: [
-            `Hey ${friend_name}, want to play some ${game_name}? I see you're online!`,
-          ],
-          enthusiastic: [
-            `${friend_name}!!! 🔥\n${game_name} is INCREDIBLE! I can't stop playing and I need a partner in crime. Let's go!!! 🚀`,
-          ],
+          serious: [`Hi ${friend_name},\n\nI'm about to start playing ${game_name} and thought you might enjoy joining. Let me know if you're interested.`],
+          casual: [`Hey ${friend_name}, want to play some ${game_name}? I see you're online!`],
+          enthusiastic: [`${friend_name}!!! 🔥\n${game_name} is INCREDIBLE! I can't stop playing and I need a partner in crime. Let's go!!! 🚀`],
         },
       };
 
       const lang = language === "en" ? "en" : "zh";
-      const styleKey = style;
-      const options = templates[lang]?.[styleKey] || templates[lang].funny;
+      const options = templates[lang]?.[style] || templates[lang].funny;
       const message = options[Math.floor(Math.random() * options.length)];
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `📨 **邀请语生成** (风格: ${style}, ${lang === "zh" ? "中文" : "English"})
+      return textResult(`📨 **邀请语生成** (风格: ${style}, ${lang === "zh" ? "中文" : "English"})
 
 ---
 
@@ -337,14 +262,10 @@ ${message}
 ---
 
 💡 你可以直接复制这段话发给 ${friend_name}！
-🎮 使用 launch_game appid=${game_name} 来启动游戏。`,
-          },
-        ],
-      };
+🎮 使用 launch_game appid=${game_name} 来启动游戏。`);
     }
   );
 
-  // ---- get_friend_summary ----
   server.tool(
     "get_friend_summary",
     "获取好友在线情况的摘要：在线人数、正在玩的游戏分类统计。",
@@ -353,20 +274,12 @@ ${message}
       const friends = await api.getEnrichedFriends();
 
       if (friends.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "无法获取好友列表。请配置 Steam API Key。",
-            },
-          ],
-        };
+        return textResult("无法获取好友列表。请配置 Steam API Key。");
       }
 
-      const online = friends.filter((f) => f.personastate !== 0);
-      const playing = online.filter((f) => f.gameextrainfo);
+      const online = friends.filter(isOnline);
+      const playing = online.filter(isPlaying);
 
-      // Group by game
       const gameGroups = new Map<string, string[]>();
       for (const f of playing) {
         const game = f.gameextrainfo || "未知游戏";
@@ -377,16 +290,9 @@ ${message}
 
       const gameLines = Array.from(gameGroups.entries())
         .sort((a, b) => b[1].length - a[1].length)
-        .map(
-          ([game, players]) =>
-            `- **${game}**: ${players.length} 人 (${players.join(", ")})`
-        );
+        .map(([game, players]) => `- **${game}**: ${players.length} 人 (${players.join(", ")})`);
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `📊 **好友摘要**
+      return textResult(`📊 **好友摘要**
 - 总好友: ${friends.length}
 - 在线: ${online.length}
 - 游戏中: ${playing.length}
@@ -395,10 +301,7 @@ ${message}
 🎮 **当前热门游戏：**
 ${gameLines.length > 0 ? gameLines.join("\n") : "无人正在游戏"}
 
-💡 使用 find_coop_game 查找适合多人游玩的游戏。`,
-          },
-        ],
-      };
+💡 使用 find_coop_game 查找适合多人游玩的游戏。`);
     }
   );
 }

@@ -62,9 +62,7 @@ export default {
     },
   },
   methods: {
-    formatPrice(value) {
-      return Number(value || 0).toFixed(2)
-    },
+    formatPrice(value) { return Number(value || 0).toFixed(2) },
   },
 }
 </script>
@@ -172,8 +170,7 @@ h3 {
   animation: shimmer 1.2s infinite linear;
 }
 
-.empty-state__title,
-.inline-error {
+.empty-state__title {
   color: #102542;
 }
 

@@ -2,13 +2,10 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import os
-import re
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
 import httpx
 from langchain_chroma import Chroma
@@ -24,18 +21,21 @@ from config import (
     knowledge_path,
     llm_http_timeout,
     max_split_char_number,
-    max_token,
     md5_path,
     model_name,
-    model_max_token,
     ollama_base_url,
     separators,
-    system_prompt,
-    system_prompt_with_tools,
     user_knowledge_path,
     vector_path,
 )
+from context_builder import build_prompt_messages
 from http_utils import async_fetch_json, async_fetch_stream_lines
+from tool_markup import (
+    FINAL_ANSWER_ONLY_INSTRUCTION,
+    looks_like_tool_markup,
+    should_buffer_tool_markup,
+    tool_markup_fallback,
+)
 
 logger = logging.getLogger("Agent")
 
@@ -45,6 +45,11 @@ _public_knowledge_loaded = False
 _user_knowledge_loaded: set[str] = set()
 _embedding_model: OllamaEmbeddings | None = None
 _vector_store_cache: dict[str, Chroma] = {}
+MAX_TOOL_TURNS = 5
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _llm_timeout_message(provider: str, model: str) -> str:
@@ -53,6 +58,23 @@ def _llm_timeout_message(provider: str, model: str) -> str:
         f"timeout={llm_http_timeout}s）。请检查本地模型/接口服务是否可用，"
         "或减少上下文、降低知识库召回数量 k、调大 Agent/config.py 的 llm_http_timeout。"
     )
+
+
+def _stream_token_from_line(provider: str, raw_line: str) -> tuple[str, bool]:
+    if provider == "openai-compatible":
+        if not raw_line.startswith("data: "):
+            return "", False
+        data_str = raw_line[6:]
+        if data_str == "[DONE]":
+            return "", True
+        chunk = json.loads(data_str)
+        choices = chunk.get("choices") or []
+        if not choices:
+            return "", False
+        return choices[0].get("delta", {}).get("content", ""), False
+
+    chunk = json.loads(raw_line)
+    return chunk.get("message", {}).get("content", ""), bool(chunk.get("done", False))
 
 
 class Agent:
@@ -91,28 +113,24 @@ class Agent:
         return self._read_messages()
 
     def _read_messages(self) -> list[dict[str, Any]]:
-        """Load chat history in the current persisted message format."""
         if not self.file_path.exists():
             return []
 
         with self.file_path.open("r", encoding="utf-8") as handle:
             raw_messages = json.load(handle)
 
-        normalized: list[dict[str, Any]] = []
         if not isinstance(raw_messages, list):
-            return normalized
+            return []
 
-        for item in raw_messages:
-            if isinstance(item, dict) and "role" in item and "content" in item:
-                normalized.append(
-                    {
-                        "role": item["role"],
-                        "content": item["content"],
-                        "timestamp": item.get("timestamp"),
-                    }
-                )
-
-        return normalized
+        return [
+            {
+                "role": item["role"],
+                "content": item["content"],
+                "timestamp": item.get("timestamp"),
+            }
+            for item in raw_messages
+            if isinstance(item, dict) and "role" in item and "content" in item
+        ]
 
     def _write_messages(self, messages: list[dict[str, Any]]) -> None:
         with self.file_path.open("w", encoding="utf-8") as handle:
@@ -181,7 +199,6 @@ class Agent:
         return removed
 
     def add_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
-        """Index one JSON knowledge file and tag it as shared or profile-owned."""
         if not self.check_md5(knowledge, profile_id=profile_id):
             return f"[Failed]The {filename} already exists"
 
@@ -205,13 +222,12 @@ class Agent:
         return f"[Success]Add {filename} into vector database"
 
     def remove_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
-        """Delete one indexed knowledge file from the vector store and md5 cache."""
         vector_store = self._get_vector_store()
         vector_store.delete(where={"$and": [{"source": filename}, {"profile_id": profile_id}]})
         self.remove_md5(knowledge, profile_id=profile_id)
         return f"[Success]Remove {filename} from vector database"
 
-    def format_func(self, docs: list[Document]) -> str:
+    def _format_docs(self, docs: list[Document]) -> str:
         if not docs:
             return ""
 
@@ -240,7 +256,7 @@ class Agent:
                 search_kwargs["filter"] = {"profile_id": {"$in": ["shared", profile_id]}}
             retriever = self._get_vector_store().as_retriever(search_kwargs=search_kwargs)
             docs = retriever.invoke(question)
-            return self.format_func(docs)
+            return self._format_docs(docs)
         except Exception as exc:
             # Retrieval is optional context. Chat should degrade to history-only
             # instead of failing when Chroma/Ollama embeddings are unavailable.
@@ -248,8 +264,7 @@ class Agent:
             return ""
 
     async def _retrieve_async(self, question: str, k: int, profile_id: str | None = None) -> str:
-        """Async wrapper — runs the synchronous Chroma query in a thread executor
-        so it doesn't block the FastAPI event loop."""
+        """Run synchronous Chroma retrieval off the FastAPI event loop."""
         return await asyncio.to_thread(self._retrieve, question, k, profile_id)
 
     def _load_public_knowledge(self) -> None:
@@ -262,209 +277,24 @@ class Agent:
         if not public_dir.exists():
             return
 
-        for json_file in public_dir.glob("*.json"):
-            try:
-                content = json_file.read_text(encoding="utf-8")
-                self.add_knowledge(content, json_file.name, profile_id="shared")
-            except Exception:
-                pass
+        self._load_knowledge_dir(public_dir, profile_id="shared")
 
     def _load_user_knowledge(self, profile_id: str) -> None:
         user_dir = Path(user_knowledge_path) / profile_id
         if not user_dir.exists():
             return
 
-        for json_file in user_dir.glob("*.json"):
+        self._load_knowledge_dir(user_dir, profile_id=profile_id)
+
+    def _load_knowledge_dir(self, directory: Path, profile_id: str) -> None:
+        for json_file in directory.glob("*.json"):
             try:
                 content = json_file.read_text(encoding="utf-8")
                 self.add_knowledge(content, json_file.name, profile_id=profile_id)
             except Exception:
+                # A corrupt optional knowledge file should not prevent the app
+                # from starting; upload-time validation handles new files.
                 pass
-
-    def _active_model_name(self) -> str:
-        ai_settings = self.settings.get("ai", {})
-        provider = ai_settings.get("provider", "ollama")
-        if provider == "openai-compatible":
-            settings = ai_settings.get("openaiCompatible", {})
-            return (settings.get("model") or "").strip() or model_name
-        settings = ai_settings.get("ollama", {})
-        return (settings.get("model") or model_name).strip() or model_name
-
-    def _active_token_limit(self) -> int:
-        chat_model = self._active_model_name()
-        return int(model_max_token.get(chat_model, max_token))
-
-    def _estimate_tokens(self, text: str) -> int:
-        """Approximate tokens without adding a tokenizer dependency."""
-        if not text:
-            return 0
-        pieces = re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]", text)
-        total = 0
-        for piece in pieces:
-            if re.fullmatch(r"[A-Za-z0-9_]+", piece):
-                total += max(1, math.ceil(len(piece) / 4))
-            else:
-                total += 1
-        return total
-
-    def _score_tokens(self, text: str) -> list[str]:
-        return [
-            token.lower()
-            for token in re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+", text)
-            if token.strip()
-        ]
-
-    def _rank_context_blocks(self, question: str, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        query_terms = Counter(self._score_tokens(question))
-        if not blocks or not query_terms:
-            return sorted(blocks, key=lambda item: item["fallback"], reverse=True)
-
-        documents = [set(self._score_tokens(block["text"])) for block in blocks]
-        doc_count = len(documents)
-        df: Counter[str] = Counter()
-        for terms in documents:
-            df.update(terms)
-
-        for block, terms in zip(blocks, documents):
-            block_terms = Counter(self._score_tokens(block["text"]))
-            score = 0.0
-            for term, query_tf in query_terms.items():
-                if term not in block_terms:
-                    continue
-                idf = math.log((doc_count + 1) / (df[term] + 1)) + 1
-                score += query_tf * block_terms[term] * idf
-            block["score"] = score + block["fallback"]
-
-        return sorted(blocks, key=lambda item: item["score"], reverse=True)
-
-    def _split_knowledge_blocks(self, context: str) -> list[str]:
-        return [part.strip() for part in context.split("\n\n") if part.strip()]
-
-    def _render_knowledge_context(self, blocks: list[str]) -> str:
-        if not blocks:
-            return ""
-        return "## Knowledge Base (retrieved references)\n" + "\n\n".join(blocks) + "\n"
-
-    def _render_history_context(self, blocks: list[str]) -> str:
-        if not blocks:
-            return ""
-        return "## Conversation History\n" + "\n".join(blocks) + "\n"
-
-    def _message_token_count(self, prompt_text: str, question: str) -> int:
-        return self._estimate_tokens(prompt_text) + self._estimate_tokens(question)
-
-    def _fit_context_to_budget(
-        self,
-        *,
-        question: str,
-        prompt_template: str,
-        knowledge_blocks: list[str],
-        history_blocks: list[str],
-    ) -> tuple[str, str]:
-        limit = self._active_token_limit()
-        empty_prompt = prompt_template.format(knowledge_context="", history_context="")
-        if self._message_token_count(empty_prompt, question) > limit:
-            raise RuntimeError(
-                f"输入内容超过当前模型 {self._active_model_name()} 的最大上下文长度 {limit} tokens。"
-            )
-
-        candidates: list[dict[str, Any]] = []
-        for index, text in enumerate(knowledge_blocks):
-            candidates.append({
-                "kind": "knowledge",
-                "text": text,
-                "order": index,
-                "fallback": 0.01 / (index + 1),
-            })
-        history_count = len(history_blocks)
-        for index, text in enumerate(history_blocks):
-            candidates.append({
-                "kind": "history",
-                "text": text,
-                "order": index,
-                "fallback": 0.005 * (index + 1) / max(history_count, 1),
-            })
-
-        selected_knowledge: list[dict[str, Any]] = []
-        selected_history: list[dict[str, Any]] = []
-        for block in self._rank_context_blocks(question, candidates):
-            trial_knowledge = selected_knowledge[:]
-            trial_history = selected_history[:]
-            if block["kind"] == "knowledge":
-                trial_knowledge.append(block)
-            else:
-                trial_history.append(block)
-
-            knowledge_text = self._render_knowledge_context(
-                [item["text"] for item in sorted(trial_knowledge, key=lambda item: item["order"])]
-            )
-            history_text = self._render_history_context(
-                [item["text"] for item in sorted(trial_history, key=lambda item: item["order"])]
-            )
-            prompt_text = prompt_template.format(
-                knowledge_context=knowledge_text,
-                history_context=history_text,
-            )
-            if self._message_token_count(prompt_text, question) <= limit:
-                selected_knowledge = trial_knowledge
-                selected_history = trial_history
-
-        knowledge_context = self._render_knowledge_context(
-            [item["text"] for item in sorted(selected_knowledge, key=lambda item: item["order"])]
-        )
-        history_context = self._render_history_context(
-            [item["text"] for item in sorted(selected_history, key=lambda item: item["order"])]
-        )
-        return knowledge_context, history_context
-
-    def _build_messages(
-        self, question: str, context: str, has_tools: bool = False
-    ) -> list[dict[str, str]]:
-        """Build provider messages from system prompt, RAG context, and history."""
-        prompt_template = system_prompt_with_tools if has_tools else system_prompt
-
-        knowledge_blocks = self._split_knowledge_blocks(context)
-
-        # ── History context: recent conversation as a labeled text block ──
-        _refusal_patterns = [
-            "我无法直接访问", "我无法访问", "我没有权限",
-            "我无法直接查看", "我无法直接获取", "我没法直接",
-            "无法直接访问", "无法直接查看", "无法直接获取",
-            "I can't access", "I cannot access",
-        ]
-        filtered: list[str] = []
-        for message in self.messages[-10:]:
-            role = message.get("role", "")
-            content = message.get("content", "")
-
-            # Tool traces are useful in the UI/history but too noisy for the
-            # next prompt. They are already reflected in the assistant answer.
-            if role in ("tool_call", "tool_result", "tool"):
-                continue
-            # Skip common "I cannot access..." answers so one degraded turn does
-            # not teach future turns to refuse the same Steam/MCP request.
-            if role == "assistant" and any(p in content for p in _refusal_patterns):
-                continue
-
-            tag = "assistant" if role == "assistant" else "user"
-            filtered.append(f"[{tag}]: {content}")
-
-        knowledge_context, history_context = self._fit_context_to_budget(
-            question=question,
-            prompt_template=prompt_template,
-            knowledge_blocks=knowledge_blocks,
-            history_blocks=filtered,
-        )
-
-        # ── Assemble prompt ──
-        prompt_text = prompt_template.format(
-            knowledge_context=knowledge_context,
-            history_context=history_context,
-        )
-        return [
-            {"role": "system", "content": prompt_text},
-            {"role": "user", "content": question},
-        ]
 
     def _provider_config(self) -> dict[str, Any]:
         provider = self.settings.get("ai", {}).get("provider", "ollama")
@@ -519,6 +349,47 @@ class Agent:
             })
         return tool_calls
 
+    def _provider_payload(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        tool_defs: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
+        if tool_defs:
+            payload["tools"] = tool_defs
+        return payload
+
+    async def _provider_token_stream(
+        self,
+        config: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> AsyncIterator[str]:
+        try:
+            async for line in async_fetch_stream_lines(
+                config["url"],
+                method="POST",
+                payload=payload,
+                headers=config["headers"],
+                timeout=llm_http_timeout,
+            ):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    content, done = _stream_token_from_line(config["provider"], raw)
+                except json.JSONDecodeError:
+                    continue
+                if done:
+                    break
+                if content:
+                    yield content
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                _llm_timeout_message(config["provider"], config["model"])
+            ) from exc
+
     async def _provider_chat(
         self,
         messages: list[dict[str, Any]],
@@ -527,56 +398,10 @@ class Agent:
         stream: bool = False,
     ) -> dict[str, Any] | AsyncIterator[str]:
         config = self._provider_config()
-        payload: dict[str, Any] = {
-            "model": config["model"],
-            "messages": messages,
-            "stream": stream,
-        }
-        if tool_defs:
-            payload["tools"] = tool_defs
+        payload = self._provider_payload(config["model"], messages, stream, tool_defs)
 
         if stream:
-            async def token_stream() -> AsyncIterator[str]:
-                try:
-                    async for line in async_fetch_stream_lines(
-                        config["url"],
-                        method="POST",
-                        payload=payload,
-                        headers=config["headers"],
-                        timeout=llm_http_timeout,
-                    ):
-                        raw = line.strip()
-                        if not raw:
-                            continue
-
-                        try:
-                            if config["provider"] == "openai-compatible":
-                                if not raw.startswith("data: "):
-                                    continue
-                                data_str = raw[6:]
-                                if data_str == "[DONE]":
-                                    break
-                                chunk = json.loads(data_str)
-                                choices = chunk.get("choices") or []
-                                if not choices:
-                                    continue
-                                content = choices[0].get("delta", {}).get("content", "")
-                            else:
-                                chunk = json.loads(raw)
-                                content = chunk.get("message", {}).get("content", "")
-                                if chunk.get("done", False):
-                                    break
-                        except json.JSONDecodeError:
-                            continue
-
-                        if content:
-                            yield content
-                except httpx.TimeoutException as exc:
-                    raise RuntimeError(
-                        _llm_timeout_message(config["provider"], config["model"])
-                    ) from exc
-
-            return token_stream()
+            return self._provider_token_stream(config, payload)
 
         try:
             response = await async_fetch_json(
@@ -603,10 +428,6 @@ class Agent:
                 raise RuntimeError("OpenAI 兼容接口未返回结果。")
             return choice.get("message", {})
         return response.get("message", {})
-
-    # ------------------------------------------------------------------
-    # Tool-calling helpers
-    # ------------------------------------------------------------------
 
     def _build_tool_call_messages(
         self, messages: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
@@ -637,51 +458,47 @@ class Agent:
         })
         return tool_entries
 
-    async def chat_stream(self, question: str, k: int = 3):
-        """Async generator: yield SSE events for streaming chat with MCP tools."""
-        context = await self._retrieve_async(question, k, profile_id=self.session_id)
-        tool_defs: list[dict[str, Any]] = []
-        if self._mcp_client is not None:
-            tool_defs = self._mcp_client.get_tool_definitions()
+    def _request_final_answer(self, messages: list[dict[str, Any]]) -> None:
+        messages.append({
+            "role": "user",
+            "content": FINAL_ANSWER_ONLY_INSTRUCTION,
+        })
 
-        messages: list[dict[str, Any]] = self._build_messages(
-            question,
-            context,
+    async def chat_stream(self, question: str, k: int = 3):
+        context = await self._retrieve_async(question, k, profile_id=self.session_id)
+        tool_defs = self._mcp_client.get_tool_definitions() if self._mcp_client else []
+
+        messages: list[dict[str, Any]] = build_prompt_messages(
+            question=question,
+            context=context,
+            history=self.messages,
+            settings=self.settings,
             has_tools=bool(tool_defs),
         )
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = utc_now()
         tool_history: list[dict[str, Any]] = []
         yield {"type": "meta", "user_message": question, "timestamp": timestamp}
 
-        async def emit_final_answer():
-            full = ""
-            try:
-                token_source = await self._provider_chat(messages, stream=True)
-                async for token in token_source:
-                    full += token
-                    yield {"type": "token", "content": token}
-            except Exception as exc:
-                yield {"type": "error", "content": str(exc)}
-                return
-            yield {"type": "done", "content": full}
-            self._persist_chat(question, full, timestamp, tool_history)
-
         if not tool_defs:
             logger.info("Streaming without MCP tools")
-            async for event in emit_final_answer():
+            async for event in self._emit_final_answer(messages, question, timestamp, tool_history):
                 yield event
             return
 
-        print(f"[Agent] MCP client ready, {len(tool_defs)} tool definitions", flush=True)
         logger.info("MCP streaming with %d tool definitions", len(tool_defs))
 
         # Tool calls must be resolved before the final answer can be streamed.
-        for _turn in range(5):
+        for _turn in range(MAX_TOOL_TURNS):
             result = await self._provider_chat(messages, tool_defs=tool_defs)
             tool_calls = result.get("tool_calls") or []
 
             if not tool_calls:
-                async for event in emit_final_answer():
+                if looks_like_tool_markup(result.get("content", "")):
+                    for event in self._emit_tool_markup_fallback(question, timestamp, tool_history):
+                        yield event
+                    return
+                self._request_final_answer(messages)
+                async for event in self._emit_final_answer(messages, question, timestamp, tool_history):
                     yield event
                 return
 
@@ -689,35 +506,91 @@ class Agent:
             for entry in entries:
                 tool_history.append({"role": "tool_call", "content": json.dumps(entry, ensure_ascii=False)})
 
-            for tc in tool_calls:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("arguments", {})
-                yield {"type": "tool_start", "tool": tool_name}
+            async for event in self._run_tool_calls(messages, tool_calls, tool_history):
+                yield event
 
-                try:
-                    tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
-                except Exception as exc:
-                    tool_result = f"工具调用失败: {exc}"
-
-                yield {"type": "tool_result", "tool": tool_name, "result": tool_result}
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", "call_1"),
-                    "content": tool_result,
-                })
-                tool_history.append({"role": "tool_result", "content": tool_result})
-
-        messages.append({
-            "role": "user",
-            "content": "请基于以上工具调用结果给出最终答案。",
-        })
-        async for event in emit_final_answer():
+        self._request_final_answer(messages)
+        async for event in self._emit_final_answer(messages, question, timestamp, tool_history):
             yield event
 
-    # ------------------------------------------------------------------
-    # Chat persistence
-    # ------------------------------------------------------------------
+    def _emit_tool_markup_fallback(
+        self,
+        question: str,
+        timestamp: str,
+        tool_history: list[dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
+        fallback = tool_markup_fallback(tool_history)
+        yield {"type": "token", "content": fallback}
+        yield {"type": "done", "content": fallback}
+        self._persist_chat(question, fallback, timestamp, tool_history)
+
+    async def _emit_final_answer(
+        self,
+        messages: list[dict[str, Any]],
+        question: str,
+        timestamp: str,
+        tool_history: list[dict[str, Any]],
+    ) -> AsyncIterator[dict[str, Any]]:
+        full = ""
+        prefix_buffer = ""
+        prefix_released = False
+        blocked_tool_markup = False
+
+        try:
+            token_source = await self._provider_chat(messages, stream=True)
+            async for token in token_source:
+                full += token
+                if prefix_released:
+                    yield {"type": "token", "content": token}
+                    continue
+
+                prefix_buffer += token
+                if looks_like_tool_markup(prefix_buffer):
+                    blocked_tool_markup = True
+                    continue
+                if should_buffer_tool_markup(prefix_buffer):
+                    continue
+                prefix_released = True
+                yield {"type": "token", "content": prefix_buffer}
+                prefix_buffer = ""
+        except Exception as exc:
+            yield {"type": "error", "content": str(exc)}
+            return
+
+        if blocked_tool_markup or looks_like_tool_markup(full):
+            for event in self._emit_tool_markup_fallback(question, timestamp, tool_history):
+                yield event
+            return
+
+        if prefix_buffer:
+            yield {"type": "token", "content": prefix_buffer}
+        yield {"type": "done", "content": full}
+        self._persist_chat(question, full, timestamp, tool_history)
+
+    async def _run_tool_calls(
+        self,
+        messages: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
+        tool_history: list[dict[str, Any]],
+    ) -> AsyncIterator[dict[str, Any]]:
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            tool_args = tc.get("arguments", {})
+            yield {"type": "tool_start", "tool": tool_name}
+
+            try:
+                tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
+            except Exception as exc:
+                tool_result = f"工具调用失败: {exc}"
+
+            yield {"type": "tool_result", "tool": tool_name, "result": tool_result}
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", "call_1"),
+                "content": tool_result,
+            })
+            tool_history.append({"role": "tool_result", "content": tool_result})
 
     def _persist_chat(
         self,
@@ -726,7 +599,6 @@ class Agent:
         timestamp: str,
         tool_history: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Save user question, assistant response, and any tool messages to history."""
         history = self.messages
         history.append({"role": "user", "content": question, "timestamp": timestamp})
         if tool_history:
@@ -734,7 +606,7 @@ class Agent:
         history.append({
             "role": "assistant",
             "content": response,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": utc_now(),
         })
         self._write_messages(history)
 

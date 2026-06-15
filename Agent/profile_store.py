@@ -7,6 +7,7 @@ from typing import Any
 
 from config import (
     history_path,
+    knowledge_path,
     legacy_history_path,
     legacy_md5_path,
     legacy_vector_path,
@@ -22,6 +23,19 @@ from config import (
     user_knowledge_path,
     vector_path,
 )
+from tool_markup import hide_tool_markup
+
+SUPPORTED_AI_PROVIDERS = {"ollama", "openai-compatible"}
+OLLAMA_DEFAULTS = {"baseUrl": ollama_base_url, "model": model_name}
+OPENAI_DEFAULTS = {"apiKey": "", "baseUrl": openai_base_url, "model": openai_model_name}
+STEAM_DEFAULTS = {
+    "apiKey": "",
+    "steamId": "",
+    "steamPath": "",
+    "country": steam_country,
+    "language": steam_language,
+    "proxy": "",
+}
 
 
 def utc_now() -> str:
@@ -33,6 +47,34 @@ def slugify(value: str) -> str:
     """Create a stable local profile id from a user-visible display name."""
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "profile"
+
+
+def clean_setting(
+    source: dict[str, Any],
+    current: dict[str, Any],
+    key: str,
+    default: str = "",
+) -> str:
+    return source.get(key, current.get(key, default)).strip()
+
+
+def clean_settings(
+    source: dict[str, Any],
+    current: dict[str, Any],
+    defaults: dict[str, str],
+) -> dict[str, str]:
+    return {
+        key: clean_setting(source, current, key, default)
+        for key, default in defaults.items()
+    }
+
+
+def safe_filename(filename: str) -> str:
+    return filename.replace("\\", "/").split("/")[-1]
+
+
+def profile_md5_path(profile_id: str) -> Path:
+    return Path(md5_path).parent / "md5" / f"{profile_id}.txt"
 
 
 class ProfileStore:
@@ -91,23 +133,10 @@ class ProfileStore:
             "updatedAt": timestamp,
             "ai": {
                 "provider": "ollama",
-                "ollama": {
-                    "baseUrl": ollama_base_url,
-                    "model": model_name,
-                },
-                "openaiCompatible": {
-                    "apiKey": "",
-                    "baseUrl": openai_base_url,
-                    "model": openai_model_name,
-                },
+                "ollama": dict(OLLAMA_DEFAULTS),
+                "openaiCompatible": dict(OPENAI_DEFAULTS),
             },
-            "steam": {
-                "apiKey": "",
-                "steamId": "",
-                "country": steam_country,
-                "language": steam_language,
-                "proxy": "",
-            },
+            "steam": dict(STEAM_DEFAULTS),
         }
 
     def profile_path(self, profile_id: str) -> Path:
@@ -158,9 +187,9 @@ class ProfileStore:
         provider = ai.get("provider", "ollama")
         if provider == "openai-compatible":
             settings = ai.get("openaiCompatible", {})
-            return bool(settings.get("apiKey") and settings.get("baseUrl") and settings.get("model"))
+            return all(settings.get(key) for key in ("apiKey", "baseUrl", "model"))
         settings = ai.get("ollama", {})
-        return bool(settings.get("baseUrl") and settings.get("model"))
+        return all(settings.get(key) for key in ("baseUrl", "model"))
 
     def create_profile(self, display_name: str) -> dict[str, Any]:
         cleaned = display_name.strip()
@@ -186,7 +215,7 @@ class ProfileStore:
         profile_path = self.profile_path(profile_id)
         history_file = self.history_file_path(profile_id)
         knowledge_dir = Path(user_knowledge_path) / profile_id
-        profile_md5_file = Path(md5_path).parent / "md5" / f"{profile_id}.txt"
+        profile_md5_file = profile_md5_path(profile_id)
 
         if not profile_path.exists():
             raise FileNotFoundError("用户不存在。")
@@ -212,84 +241,63 @@ class ProfileStore:
         if ai:
             profile_ai = profile.setdefault("ai", {})
             provider = ai.get("provider") or profile_ai.get("provider", "ollama")
-            if provider not in {"ollama", "openai-compatible"}:
+            if provider not in SUPPORTED_AI_PROVIDERS:
                 raise ValueError("不支持的 AI provider。")
             profile_ai["provider"] = provider
 
             if isinstance(ai.get("ollama"), dict):
                 current = profile_ai.setdefault("ollama", {})
-                current.update(
-                    {
-                        "baseUrl": ai["ollama"].get("baseUrl", current.get("baseUrl", ollama_base_url)).strip(),
-                        "model": ai["ollama"].get("model", current.get("model", model_name)).strip(),
-                    }
-                )
+                current.update(clean_settings(ai["ollama"], current, OLLAMA_DEFAULTS))
 
             if isinstance(ai.get("openaiCompatible"), dict):
                 current = profile_ai.setdefault("openaiCompatible", {})
-                current.update(
-                    {
-                        "apiKey": ai["openaiCompatible"].get("apiKey", current.get("apiKey", "")).strip(),
-                        "baseUrl": ai["openaiCompatible"].get("baseUrl", current.get("baseUrl", openai_base_url)).strip(),
-                        "model": ai["openaiCompatible"].get("model", current.get("model", openai_model_name)).strip(),
-                    }
-                )
+                current.update(clean_settings(ai["openaiCompatible"], current, OPENAI_DEFAULTS))
 
         if steam:
             profile_steam = profile.setdefault("steam", {})
-            profile_steam.update(
-                {
-                    "apiKey": steam.get("apiKey", profile_steam.get("apiKey", "")).strip(),
-                    "steamId": steam.get("steamId", profile_steam.get("steamId", "")).strip(),
-                    "country": steam.get("country", profile_steam.get("country", steam_country)).strip() or steam_country,
-                    "language": steam.get("language", profile_steam.get("language", steam_language)).strip() or steam_language,
-                    "proxy": steam.get("proxy", profile_steam.get("proxy", "")).strip(),
-                }
-            )
+            profile_steam.update(clean_settings(steam, profile_steam, STEAM_DEFAULTS))
+            profile_steam["country"] = profile_steam["country"] or steam_country
+            profile_steam["language"] = profile_steam["language"] or steam_language
 
         profile["updatedAt"] = utc_now()
         self._write_json(self.profile_path(profile_id), profile)
         return profile
 
+    def _chat_message(self, role: str, content: str, timestamp: str | None = None) -> dict[str, Any]:
+        return {"role": role, "content": content, "timestamp": timestamp or utc_now()}
+
+    def _normalize_message(self, item: Any) -> dict[str, Any] | None:
+        """Normalize current app messages and older LangChain history records."""
+        if not isinstance(item, dict):
+            return None
+
+        if "role" in item and "content" in item:
+            role = item["role"]
+            content = hide_tool_markup(role, item["content"])
+            return self._chat_message(role, content, item.get("timestamp"))
+
+        role_map = {"human": "user", "ai": "assistant", "assistant": "assistant"}
+        role = role_map.get(item.get("type"))
+        payload = item.get("data", {})
+        if not role or not isinstance(payload, dict):
+            return None
+
+        content = payload.get("content", "")
+        if role == "assistant":
+            content = hide_tool_markup(role, content)
+        return self._chat_message(role, content, item.get("timestamp"))
+
     def load_messages(self, profile_id: str) -> list[dict[str, Any]]:
         """Load one profile's chat history and normalize legacy message shapes."""
         raw_messages = self._read_json(self.history_file_path(profile_id), [])
-        normalized: list[dict[str, Any]] = []
         if not isinstance(raw_messages, list):
-            return normalized
+            return []
 
+        normalized: list[dict[str, Any]] = []
         for item in raw_messages:
-            if isinstance(item, dict) and "role" in item and "content" in item:
-                normalized.append(
-                    {
-                        "role": item["role"],
-                        "content": item["content"],
-                        "timestamp": item.get("timestamp") or utc_now(),
-                    }
-                )
-                continue
-
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("type")
-            payload = item.get("data", {})
-            if role == "human":
-                normalized.append(
-                    {
-                        "role": "user",
-                        "content": payload.get("content", ""),
-                        "timestamp": item.get("timestamp") or utc_now(),
-                    }
-                )
-            elif role in {"ai", "assistant"}:
-                normalized.append(
-                    {
-                        "role": "assistant",
-                        "content": payload.get("content", ""),
-                        "timestamp": item.get("timestamp") or utc_now(),
-                    }
-                )
+            message = self._normalize_message(item)
+            if message:
+                normalized.append(message)
 
         return normalized
 
@@ -302,12 +310,11 @@ class ProfileStore:
         return dir_path
 
     def _knowledge_file_path(self, profile_id: str, filename: str) -> Path:
-        safe_name = filename.replace("\\", "/").split("/")[-1]
-        return self.knowledge_dir(profile_id) / safe_name
+        return self.knowledge_dir(profile_id) / safe_filename(filename)
 
     def list_knowledge_files(self, profile_id: str) -> dict[str, list[dict[str, Any]]]:
         public_files: list[dict[str, Any]] = []
-        public_dir = Path(__import__("config").knowledge_path)
+        public_dir = Path(knowledge_path)
         if public_dir.exists():
             for f in sorted(public_dir.glob("*.json")):
                 public_files.append({"name": f.name, "size": f.stat().st_size, "source": "public"})
@@ -327,7 +334,7 @@ class ProfileStore:
     def save_knowledge_file(self, profile_id: str, filename: str, content: bytes) -> Path:
         # Only keep the basename from the browser-provided filename. This blocks
         # path traversal while still preserving the user's visible file name.
-        safe_name = filename.replace("\\", "/").split("/")[-1]
+        safe_name = safe_filename(filename)
         if not safe_name or safe_name in {".", ".."} or len(safe_name) > 160:
             raise ValueError("文件名不合法。")
         if any(char in safe_name for char in '<>:"|?*'):

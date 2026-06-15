@@ -1,14 +1,12 @@
-// ============================================================================
-// Game Launcher — launch Steam games via steam:// protocol
-// ============================================================================
-
 import { exec } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { detectSteamPath } from "./vdf.js";
 
-/** Launch a Steam game by app ID */
-export function launchGame(appid: number): Promise<{ success: boolean; message: string }> {
+export function launchGame(
+  appid: number,
+  steamPath: string = detectSteamPath()
+): Promise<{ success: boolean; message: string }> {
   return new Promise((resolve) => {
     const url = `steam://run/${appid}`;
 
@@ -28,7 +26,6 @@ export function launchGame(appid: number): Promise<{ success: boolean; message: 
     exec(command, (error) => {
       if (error) {
         // Fallback: try running via steam.exe directly
-        const steamPath = detectSteamPath();
         const steamExe = process.platform === "win32"
           ? path.join(steamPath, "Steam.exe")
           : process.platform === "darwin"
@@ -40,11 +37,11 @@ export function launchGame(appid: number): Promise<{ success: boolean; message: 
             ? `"${steamExe}" steam://run/${appid}`
             : `${steamExe} steam://run/${appid}`;
 
-          exec(fallbackCmd, (err2) => {
-            if (err2) {
+          exec(fallbackCmd, (fallbackError) => {
+            if (fallbackError) {
               resolve({
                 success: false,
-                message: `Failed to launch app ${appid}: ${err2.message}. You can manually open steam://run/${appid}`,
+                message: `Failed to launch app ${appid}: ${fallbackError.message}. You can manually open steam://run/${appid}`,
               });
             } else {
               resolve({

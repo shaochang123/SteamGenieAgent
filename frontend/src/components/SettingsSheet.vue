@@ -21,18 +21,13 @@
 
             <div class="segmented">
               <button
+                v-for="option in providerOptions"
+                :key="option.value"
                 type="button"
-                :class="{ active: draft.ai.provider === 'ollama' }"
-                @click="draft.ai.provider = 'ollama'"
+                :class="{ active: draft.ai.provider === option.value }"
+                @click="draft.ai.provider = option.value"
               >
-                Ollama
-              </button>
-              <button
-                type="button"
-                :class="{ active: draft.ai.provider === 'openai-compatible' }"
-                @click="draft.ai.provider = 'openai-compatible'"
-              >
-                OpenAI 兼容
+                {{ option.label }}
               </button>
             </div>
 
@@ -44,31 +39,14 @@
               }}
             </p>
 
-            <template v-if="draft.ai.provider === 'ollama'">
-              <label class="field">
-                <span>Ollama Base URL</span>
-                <input v-model.trim="draft.ai.ollama.baseUrl" type="text" placeholder="http://127.0.0.1:11434">
-              </label>
-              <label class="field">
-                <span>Ollama Model</span>
-                <input v-model.trim="draft.ai.ollama.model" type="text" placeholder="qwen3:8b">
-              </label>
-            </template>
-
-            <template v-else>
-              <label class="field">
-                <span>API Key</span>
-                <input v-model.trim="draft.ai.openaiCompatible.apiKey" type="password" placeholder="sk-...">
-              </label>
-              <label class="field">
-                <span>Base URL</span>
-                <input v-model.trim="draft.ai.openaiCompatible.baseUrl" type="text" placeholder="https://api.openai.com/v1">
-              </label>
-              <label class="field">
-                <span>Model</span>
-                <input v-model.trim="draft.ai.openaiCompatible.model" type="text" placeholder="gpt-4.1-mini">
-              </label>
-            </template>
+            <label v-for="field in aiFields" :key="field.key" class="field">
+              <span>{{ field.label }}</span>
+              <input
+                v-model.trim="draft.ai[field.group][field.key]"
+                :type="field.type"
+                :placeholder="field.placeholder"
+              >
+            </label>
           </section>
 
           <section class="section">
@@ -77,26 +55,14 @@
               <span>用于个人数据和商店卡片</span>
             </div>
 
-            <label class="field">
-              <span>Steam API Key</span>
-              <input v-model.trim="draft.steam.apiKey" type="password" placeholder="Steam Web API Key">
-            </label>
-            <label class="field">
-              <span>SteamID64</span>
-              <input v-model.trim="draft.steam.steamId" type="text" placeholder="7656119...">
-            </label>
-            <label class="field">
-              <span>Country</span>
-              <input v-model.trim="draft.steam.country" type="text" placeholder="CN">
-            </label>
-            <label class="field">
-              <span>Language</span>
-              <input v-model.trim="draft.steam.language" type="text" placeholder="zh-CN">
-            </label>
-            <label class="field">
-              <span>HTTP 代理 (Proxy)</span>
-              <input v-model.trim="draft.steam.proxy" type="text" placeholder="http://127.0.0.1:7890">
-              <span class="field-hint">用于访问 Steam API 的代理地址，留空则不使用代理</span>
+            <label v-for="field in steamFields" :key="field.key" class="field">
+              <span>{{ field.label }}</span>
+              <input
+                v-model.trim="draft.steam[field.key]"
+                :type="field.type"
+                :placeholder="field.placeholder"
+              >
+              <span v-if="field.hint" class="field-hint">{{ field.hint }}</span>
             </label>
           </section>
         </div>
@@ -115,6 +81,31 @@
 </template>
 
 <script>
+const PROVIDER_OPTIONS = [
+  { value: 'ollama', label: 'Ollama' },
+  { value: 'openai-compatible', label: 'OpenAI 兼容' },
+]
+
+const OLLAMA_FIELDS = [
+  { group: 'ollama', key: 'baseUrl', label: 'Ollama Base URL', type: 'text', placeholder: 'http://127.0.0.1:11434' },
+  { group: 'ollama', key: 'model', label: 'Ollama Model', type: 'text', placeholder: 'qwen3:8b' },
+]
+
+const OPENAI_FIELDS = [
+  { group: 'openaiCompatible', key: 'apiKey', label: 'API Key', type: 'password', placeholder: 'sk-...' },
+  { group: 'openaiCompatible', key: 'baseUrl', label: 'Base URL', type: 'text', placeholder: 'https://api.openai.com/v1' },
+  { group: 'openaiCompatible', key: 'model', label: 'Model', type: 'text', placeholder: 'gpt-4.1-mini' },
+]
+
+const STEAM_FIELDS = [
+  { key: 'apiKey', label: 'Steam API Key', type: 'password', placeholder: 'Steam Web API Key' },
+  { key: 'steamId', label: 'SteamID64', type: 'text', placeholder: '7656119...' },
+  { key: 'steamPath', label: 'Steam Install Path', type: 'text', placeholder: 'D:\\steam', hint: '本地 Steam 安装目录' },
+  { key: 'country', label: 'Country', type: 'text', placeholder: 'CN' },
+  { key: 'language', label: 'Language', type: 'text', placeholder: 'zh-CN' },
+  { key: 'proxy', label: 'HTTP 代理 (Proxy)', type: 'text', placeholder: 'http://127.0.0.1:7890', hint: '用于访问 Steam API 的代理地址，留空则不使用代理' },
+]
+
 function normalizeProfile(profile) {
   if (!profile) {
     return null
@@ -136,6 +127,7 @@ function normalizeProfile(profile) {
     steam: {
       apiKey: profile.steam?.apiKey || '',
       steamId: profile.steam?.steamId || '',
+      steamPath: profile.steam?.steamPath || '',
       country: profile.steam?.country || 'CN',
       language: profile.steam?.language || 'zh-CN',
       proxy: profile.steam?.proxy || '',
@@ -180,6 +172,17 @@ export default {
           this.resetDraft()
         }
       },
+    },
+  },
+  computed: {
+    providerOptions() {
+      return PROVIDER_OPTIONS
+    },
+    aiFields() {
+      return this.draft?.ai.provider === 'ollama' ? OLLAMA_FIELDS : OPENAI_FIELDS
+    },
+    steamFields() {
+      return STEAM_FIELDS
     },
   },
   methods: {

@@ -40,11 +40,6 @@ def append_query(url: str, **params: Any) -> str:
     return f"{url}{separator}{query}"
 
 
-# ---------------------------------------------------------------------------
-# Async HTTP helpers (httpx-based)
-# ---------------------------------------------------------------------------
-
-
 def _client_for(proxy: str | None = None) -> httpx.AsyncClient:
     """Return a client.  When *proxy* is given, create a temporary client
     configured with that proxy; otherwise reuse the module-level singleton."""

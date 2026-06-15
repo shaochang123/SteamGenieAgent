@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import sys
@@ -39,37 +38,26 @@ _mcp_pool: dict[str, PersistentMCPClientManager] = {}
 
 
 async def get_or_create_mcp_client(profile_id: str) -> PersistentMCPClientManager | None:
-    """Return a cached MCP manager for *profile_id*, or create one if the
-    profile has Steam credentials configured."""
     profile = store.get_profile(profile_id)
     steam = profile.get("steam", {})
     api_key = steam.get("apiKey", "")
     steam_id = steam.get("steamId", "")
-    has_creds = bool(api_key and steam_id)
+    steam_path = steam.get("steamPath", "")
+    has_mcp_config = bool((api_key and steam_id) or steam_path)
 
     logger.info(
-        "MCP check for %s — apiKey=%s steamId=%s has_creds=%s",
+        "MCP check for %s — apiKey=%s steamId=%s steamPath=%s has_mcp_config=%s",
         profile_id,
         "***" if api_key else "(empty)",
         "configured" if steam_id else "(empty)",
-        has_creds,
+        "configured" if steam_path else "(empty)",
+        has_mcp_config,
     )
-    # Fail-safe print — ensures visibility even if logging is misconfigured.
-    print(
-        f"[MCP] check profile={profile_id} has_creds={has_creds} "
-        f"apiKey={'***' if api_key else 'missing'} "
-        f"steamId={'configured' if steam_id else 'missing'}",
-        flush=True,
-    )
-
-    # Invalidate cached manager if it exists for a profile that no longer has creds
-    if not has_creds:
-        old = _mcp_pool.pop(profile_id, None)
-        if old is not None:
-            logger.info("Removing MCP client for %s (credentials removed)", profile_id)
-            await old.stop()
+    # Invalidate cached manager if it exists for a profile that no longer has
+    # either API credentials or a local Steam path.
+    if not has_mcp_config:
+        await invalidate_mcp_client(profile_id)
         logger.info("MCP skipped for %s — missing Steam credentials", profile_id)
-        print(f"[MCP] skipped profile={profile_id} — missing Steam credentials", flush=True)
         return None
 
     manager = _mcp_pool.get(profile_id)
@@ -80,12 +68,12 @@ async def get_or_create_mcp_client(profile_id: str) -> PersistentMCPClientManage
     manager = PersistentMCPClientManager(profile)
     try:
         tools = await manager.start()
-        tool_names = [getattr(t, "name", str(t)) for t in tools]
+        tool_names = ", ".join(getattr(t, "name", str(t)) for t in tools) or "(none)"
         logger.info(
             "MCP client ready for %s — %d tools: %s",
             profile_id,
             len(tools),
-            ", ".join(tool_names) if tool_names else "(none)",
+            tool_names,
         )
     except Exception:
         logger.warning("Failed to start MCP client for profile %s", profile_id, exc_info=True)
@@ -96,14 +84,12 @@ async def get_or_create_mcp_client(profile_id: str) -> PersistentMCPClientManage
 
 
 async def invalidate_mcp_client(profile_id: str) -> None:
-    """Stop and remove the cached MCP manager for *profile_id*."""
     manager = _mcp_pool.pop(profile_id, None)
     if manager is not None:
         await manager.stop()
 
 
 async def stop_all_mcp_clients() -> None:
-    """Stop all cached MCP managers (called on app shutdown)."""
     for profile_id in list(_mcp_pool.keys()):
         manager = _mcp_pool.pop(profile_id)
         await manager.stop()
@@ -111,7 +97,6 @@ async def stop_all_mcp_clients() -> None:
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
-    """FastAPI lifespan — cleanup async resources on shutdown."""
     yield
     await stop_all_mcp_clients()
     await close_async_client()
@@ -163,9 +148,40 @@ def build_agent(profile_id: str, mcp_client=None) -> Agent:
     )
 
 
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
+def require_question(question: str) -> str:
+    """Validate and normalize chat input once for both chat endpoints."""
+    cleaned = question.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="消息不能为空。")
+    return cleaned
+
+
+async def build_chat_agent(profile_id: str) -> Agent:
+    # Steam/MCP tools are optional. Missing credentials return None and the
+    # agent falls back to plain RAG + history chat.
+    mcp_client = await get_or_create_mcp_client(profile_id)
+    return build_agent(profile_id, mcp_client=mcp_client)
+
+
+def sse_event(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def collect_chat_answer(agent: Agent, question: str, k: int) -> str:
+    answer = ""
+    async for event in agent.chat_stream(question=question, k=k):
+        event_type = event.get("type")
+        if event_type == "token":
+            answer += event.get("content", "")
+        elif event_type == "done":
+            answer = event.get("content", answer)
+        elif event_type == "error":
+            raise RuntimeError(event.get("content", "聊天服务异常。"))
+    return answer
+
+
+def profile_steam_service(profile_id: str) -> SteamService:
+    return SteamService(resolve_profile(profile_id))
 
 
 @app.get("/")
@@ -175,7 +191,6 @@ async def root() -> dict[str, Any]:
 
 @app.get("/mcp/status")
 async def mcp_status() -> dict[str, Any]:
-    """Diagnostic endpoint — shows MCP state for all profiles."""
     result: dict[str, Any] = {}
     for pid in (p["id"] for p in store.list_profiles()):
         profile = store.get_profile(pid)
@@ -184,15 +199,11 @@ async def mcp_status() -> dict[str, Any]:
         manager = _mcp_pool.get(pid)
         result[pid] = {
             "hasSteamCreds": has_creds,
+            "hasSteamPath": bool(steam.get("steamPath")),
             "mcpRunning": manager is not None and manager.is_running,
             "mcpCached": manager is not None,
         }
     return {"profiles": result}
-
-
-# ---------------------------------------------------------------------------
-# Profiles
-# ---------------------------------------------------------------------------
 
 
 @app.get("/profiles")
@@ -237,42 +248,19 @@ async def update_profile_config(profile_id: str, req: ProfileConfigRequest) -> d
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-# ---------------------------------------------------------------------------
-# Messages
-# ---------------------------------------------------------------------------
-
-
 @app.get("/profiles/{profile_id}/messages")
 async def get_profile_messages(profile_id: str) -> dict[str, Any]:
     resolve_profile(profile_id)
     return {"messages": store.load_messages(profile_id)}
 
 
-# ---------------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------------
-
-
 @app.post("/chat")
 async def chat(req: ChatRequest) -> dict[str, Any]:
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="消息不能为空。")
-
-    # Steam/MCP tools are optional. Missing credentials return None and the
-    # agent falls back to plain RAG + history chat.
-    mcp_client = await get_or_create_mcp_client(req.profileId)
-    agent = build_agent(req.profileId, mcp_client=mcp_client)
+    question = require_question(req.question)
+    agent = await build_chat_agent(req.profileId)
 
     try:
-        answer = ""
-        async for event in agent.chat_stream(question=req.question.strip(), k=req.k):
-            event_type = event.get("type")
-            if event_type == "token":
-                answer += event.get("content", "")
-            elif event_type == "done":
-                answer = event.get("content", answer)
-            elif event_type == "error":
-                raise RuntimeError(event.get("content", "聊天服务异常。"))
+        answer = await collect_chat_answer(agent, question, req.k)
         return {
             "answer": answer,
             "messages": store.load_messages(req.profileId),
@@ -288,51 +276,32 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="消息不能为空。")
-
-    # The same fallback rule applies to streaming: no Steam credentials means
-    # no tool calls, not a failed chat request.
-    mcp_client = await get_or_create_mcp_client(req.profileId)
-    agent = build_agent(req.profileId, mcp_client=mcp_client)
+    question = require_question(req.question)
+    agent = await build_chat_agent(req.profileId)
 
     async def event_generator():
         try:
             # chat_stream handles both MCP and non-MCP paths
             # using fully async I/O — never blocks the event loop.
-            async for event in agent.chat_stream(question=req.question.strip(), k=req.k):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            async for event in agent.chat_stream(question=question, k=req.k):
+                yield sse_event(event)
         except RuntimeError as exc:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(exc)}, ensure_ascii=False)}\n\n"
+            yield sse_event({"type": "error", "content": str(exc)})
         except Exception:
             logger.exception("Unexpected streaming chat failure for profile %s", req.profileId)
-            yield f"data: {json.dumps({'type': 'error', 'content': '聊天服务异常，请查看后端日志。'}, ensure_ascii=False)}\n\n"
+            yield sse_event({"type": "error", "content": "聊天服务异常，请查看后端日志。"})
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------------------------
-# Steam
-# ---------------------------------------------------------------------------
-
-
 @app.get("/profiles/{profile_id}/steam/overview")
 async def get_steam_overview(profile_id: str) -> dict[str, Any]:
-    profile = resolve_profile(profile_id)
-    service = SteamService(profile)
-    return await service.async_get_overview()
+    return await profile_steam_service(profile_id).async_get_overview()
 
 
 @app.get("/profiles/{profile_id}/steam/deals")
 async def get_steam_deals(profile_id: str) -> dict[str, Any]:
-    profile = resolve_profile(profile_id)
-    service = SteamService(profile)
-    return await service.async_get_deals()
-
-
-# ---------------------------------------------------------------------------
-# Knowledge
-# ---------------------------------------------------------------------------
+    return await profile_steam_service(profile_id).async_get_deals()
 
 
 @app.get("/profiles/{profile_id}/knowledge")
@@ -341,11 +310,9 @@ async def get_knowledge(profile_id: str) -> dict[str, Any]:
     return store.list_knowledge_files(profile_id)
 
 
-@app.post("/profiles/{profile_id}/knowledge")
-async def upload_knowledge(profile_id: str, file: UploadFile):
-    resolve_profile(profile_id)
-
-    if not file.filename or not file.filename.lower().endswith(".json"):
+async def read_knowledge_upload(file: UploadFile) -> tuple[str, bytes, str]:
+    filename = file.filename or ""
+    if not filename.lower().endswith(".json"):
         raise HTTPException(status_code=400, detail="仅支持上传 .json 文件。")
 
     declared_size = getattr(file, "size", None)
@@ -361,14 +328,21 @@ async def upload_knowledge(profile_id: str, file: UploadFile):
     try:
         knowledge_text = content.decode("utf-8")
         json.loads(knowledge_text)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(status_code=400, detail="文件内容不是有效的 JSON。")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="文件内容不是有效的 JSON。") from exc
+
+    return filename, content, knowledge_text
+
+
+@app.post("/profiles/{profile_id}/knowledge")
+async def upload_knowledge(profile_id: str, file: UploadFile):
+    resolve_profile(profile_id)
+    filename, content, knowledge_text = await read_knowledge_upload(file)
 
     agent = build_agent(profile_id)
     if not agent.check_md5(knowledge_text, profile_id=profile_id):
         raise HTTPException(status_code=409, detail="知识库内容已存在。")
 
-    filename = file.filename
     try:
         store.save_knowledge_file(profile_id, filename, content)
     except ValueError as exc:
@@ -398,11 +372,6 @@ async def delete_knowledge(profile_id: str, filename: str) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("Failed to delete knowledge for profile %s: %s", profile_id, filename)
         raise HTTPException(status_code=500, detail="删除知识库文件失败。") from exc
-
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

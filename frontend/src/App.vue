@@ -17,11 +17,11 @@
       <section class="panel panel--chat">
         <ChatPane
           :profile="state.selectedProfile"
-          :messages="state.messages"
-          :loading="state.loading.conversation"
-          :sending="state.loading.sending"
-          :error="state.error.chat"
-          :streaming-content="state.streamingContent"
+          :messages="activeChatSession.messages"
+          :loading="activeChatSession.loading"
+          :sending="activeChatSession.sending"
+          :error="activeChatSession.error"
+          :streaming-content="activeChatSession.streamingContent"
           @open-settings="state.dialogs.settings = true"
           @send-message="handleSendMessage"
         />
@@ -39,16 +39,8 @@
       </section>
     </main>
 
-    <p v-if="state.error.profiles" class="floating-error">
-      {{ state.error.profiles }}
-    </p>
-
-    <p v-if="state.error.settings" class="floating-error floating-error--bottom">
-      {{ state.error.settings }}
-    </p>
-
-    <p v-if="state.error.steam" class="floating-error floating-error--bottom-secondary">
-      {{ state.error.steam }}
+    <p v-for="error in floatingErrors" :key="error.key" :class="['floating-error', error.className]">
+      {{ error.text }}
     </p>
 
     <CreateProfileDialog
@@ -73,13 +65,8 @@
 import {
   createProfile,
   deleteProfile,
-  getProfile,
-  getProfileMessages,
-  getSteamDeals,
-  getSteamOverview,
   listProfiles,
   normalizeError,
-  sendChatStream,
   updateProfileConfig,
 } from './api/api'
 import ChatPane from './components/ChatPane.vue'
@@ -88,7 +75,16 @@ import ProfileSidebar from './components/ProfileSidebar.vue'
 import SettingsSheet from './components/SettingsSheet.vue'
 import SteamDealsCard from './components/SteamDealsCard.vue'
 import SteamOverviewCard from './components/SteamOverviewCard.vue'
-import { appStore, createEmptyDeals, createEmptyOverview } from './store/appStore'
+import { loadProfileContext } from './services/profileContext'
+import { validateProfileSettings } from './services/settingsValidation'
+import { loadSteamCards, resetSteamCards } from './services/steamCards'
+import { appStore } from './store/appStore'
+import {
+  activeChatSession,
+  deleteChatSession,
+  ensureChatSession,
+  sendProfileMessage,
+} from './store/chatSessions'
 
 export default {
   name: 'App',
@@ -108,28 +104,21 @@ export default {
   async created() {
     await this.loadProfiles()
   },
+  computed: {
+    activeChatSession() {
+      return activeChatSession(this.state)
+    },
+    floatingErrors() {
+      return [
+        { key: 'profiles', text: this.state.error.profiles, className: '' },
+        { key: 'settings', text: this.state.error.settings, className: 'floating-error--bottom' },
+        { key: 'steam', text: this.state.error.steam, className: 'floating-error--bottom-secondary' },
+      ].filter((error) => error.text)
+    },
+  },
   methods: {
-    validateSettings(payload) {
-      if (!payload || !payload.ai) {
-        return '缺少 AI 配置。'
-      }
-
-      if (payload.ai.provider === 'ollama') {
-        if (!payload.ai.ollama?.baseUrl || !payload.ai.ollama?.model) {
-          return '选择 Ollama 时需要填写 Base URL 和 Model。'
-        }
-        return ''
-      }
-
-      if (
-        !payload.ai.openaiCompatible?.apiKey ||
-        !payload.ai.openaiCompatible?.baseUrl ||
-        !payload.ai.openaiCompatible?.model
-      ) {
-        return '选择 OpenAI 兼容接口时需要填写 API Key、Base URL 和 Model。'
-      }
-
-      return ''
+    isSelectedProfile(profileId) {
+      return this.state.selectedProfileId === profileId
     },
     async refreshProfileSummaries(preferredProfileId) {
       const response = await listProfiles()
@@ -153,9 +142,40 @@ export default {
     clearSelectedProfileState() {
       this.state.selectedProfileId = ''
       this.state.selectedProfile = null
-      this.state.messages = []
-      this.state.steamOverview = createEmptyOverview()
-      this.state.steamDeals = createEmptyDeals()
+      resetSteamCards(this.state)
+    },
+    async loadSteamForProfile(profileId) {
+      this.state.loading.steam = true
+      this.state.error.steam = ''
+
+      try {
+        const steamCards = await loadSteamCards(profileId)
+        if (!this.isSelectedProfile(profileId)) {
+          return
+        }
+
+        this.state.steamOverview = steamCards.overview
+        this.state.steamDeals = steamCards.deals
+        this.state.error.steam = steamCards.error
+      } finally {
+        if (this.isSelectedProfile(profileId)) {
+          this.state.loading.steam = false
+        }
+      }
+    },
+    async loadConversationForProfile(profileId, chatSession) {
+      try {
+        const context = await loadProfileContext(profileId)
+        if (this.isSelectedProfile(profileId)) {
+          this.state.selectedProfile = context.profile
+        }
+        if (!chatSession.sending) {
+          chatSession.messages = context.messages
+        }
+        chatSession.error = context.error
+      } finally {
+        chatSession.loading = false
+      }
     },
     async loadProfiles(selectProfileId) {
       this.state.loading.profiles = true
@@ -186,64 +206,16 @@ export default {
         return
       }
 
+      const chatSession = ensureChatSession(this.state, profileId)
       this.state.selectedProfileId = profileId
-      this.state.loading.conversation = true
-      this.state.loading.steam = true
-      this.state.error.chat = ''
-      this.state.error.steam = ''
+      chatSession.loading = true
+      chatSession.error = ''
 
       // Load conversation data and Steam data independently.
       // Conversation (profile + messages) must render immediately;
       // slow Steam API calls must not block it.
-      const loadConversation = (async () => {
-        try {
-          const [profileRes, messagesRes] = await Promise.allSettled([
-            getProfile(profileId),
-            getProfileMessages(profileId),
-          ])
-
-          if (profileRes.status === 'fulfilled') {
-            this.state.selectedProfile = profileRes.value.data.profile
-          } else {
-            this.state.selectedProfile = null
-            this.state.error.chat = normalizeError(profileRes.reason)
-          }
-
-          if (messagesRes.status === 'fulfilled') {
-            this.state.messages = messagesRes.value.data.messages || []
-          } else {
-            this.state.messages = []
-            this.state.error.chat = this.state.error.chat || normalizeError(messagesRes.reason)
-          }
-        } finally {
-          this.state.loading.conversation = false
-        }
-      })()
-
-      const loadSteam = (async () => {
-        try {
-          const [overviewRes, dealsRes] = await Promise.allSettled([
-            getSteamOverview(profileId),
-            getSteamDeals(profileId),
-          ])
-
-          if (overviewRes.status === 'fulfilled') {
-            this.state.steamOverview = overviewRes.value.data || createEmptyOverview()
-          } else {
-            this.state.steamOverview = createEmptyOverview()
-            this.state.error.steam = normalizeError(overviewRes.reason)
-          }
-
-          if (dealsRes.status === 'fulfilled') {
-            this.state.steamDeals = dealsRes.value.data || createEmptyDeals()
-          } else {
-            this.state.steamDeals = createEmptyDeals()
-            this.state.error.steam = this.state.error.steam || normalizeError(dealsRes.reason)
-          }
-        } finally {
-          this.state.loading.steam = false
-        }
-      })()
+      const loadConversation = this.loadConversationForProfile(profileId, chatSession)
+      const loadSteam = this.loadSteamForProfile(profileId)
 
       await Promise.all([loadConversation, loadSteam])
     },
@@ -282,7 +254,9 @@ export default {
       )
 
       try {
-        await deleteProfile(this.state.selectedProfileId)
+        const deletedProfileId = this.state.selectedProfileId
+        await deleteProfile(deletedProfileId)
+        deleteChatSession(this.state, deletedProfileId)
         this.closeSettings()
         if (nextProfile) {
           await this.loadProfiles(nextProfile.id)
@@ -301,7 +275,7 @@ export default {
         return
       }
 
-      const validationError = this.validateSettings(payload)
+      const validationError = validateProfileSettings(payload)
       if (validationError) {
         this.state.error.settings = validationError
         return
@@ -329,125 +303,18 @@ export default {
         return
       }
 
-      this.state.loading.sending = true
-      this.state.error.chat = ''
-      this.state.streamingContent = ''
-
-      // Show user message immediately
-      const timestamp = new Date().toISOString()
-      this.state.messages.push({
-        role: 'user',
-        content: question,
-        timestamp,
+      const profileId = this.state.selectedProfileId
+      await sendProfileMessage(this.state, profileId, question, {
+        onDone: () => this.refreshProfileSummaries(),
       })
-
-      // Placeholder for assistant response — we track a reference to the
-      // placeholder object so tool-call inserts before it don't invalidate
-      // index-based access in callbacks.
-      const assistantPlaceholder = {
-        role: 'assistant',
-        content: '',
-        timestamp: '',
-      }
-      this.state.messages.push(assistantPlaceholder)
-
-      // Track pending tool-result placeholder indices for correct update
-      const pendingToolResults = []
-
-      try {
-        await sendChatStream(this.state.selectedProfileId, question, 3, {
-          onToken: (content) => {
-            this.state.streamingContent += content
-            assistantPlaceholder.content += content
-          },
-          onDone: () => {
-            // Token-by-token accumulation already built the full response.
-            assistantPlaceholder.timestamp = new Date().toISOString()
-            this.state.streamingContent = ''
-            this.state.loading.sending = false
-            this.refreshProfileSummaries(this.state.selectedProfileId)
-          },
-          onError: (error) => {
-            // Remove the assistant placeholder on error
-            const idx = this.state.messages.indexOf(assistantPlaceholder)
-            if (idx !== -1) {
-              this.state.messages.splice(idx, 1)
-            }
-            this.state.streamingContent = ''
-            this.state.error.chat = error
-            this.state.loading.sending = false
-          },
-          onToolStart: (tool) => {
-            // Insert tool_call and tool_result BEFORE the assistant placeholder
-            const placeholderIdx = this.state.messages.indexOf(assistantPlaceholder)
-            if (placeholderIdx === -1) return
-            this.state.messages.splice(placeholderIdx, 0, {
-              role: 'tool_call',
-              content: `正在调用: ${tool}`,
-              timestamp: new Date().toISOString(),
-            })
-            const resultIdx = placeholderIdx + 1
-            this.state.messages.splice(resultIdx, 0, {
-              role: 'tool_result',
-              content: '等待结果...',
-              timestamp: new Date().toISOString(),
-            })
-            pendingToolResults.push({ tool, index: resultIdx })
-          },
-          onToolResult: (tool, result) => {
-            // Update the matching tool_result placeholder by tracked index
-            const entry = pendingToolResults.find(
-              (e) => e.tool === tool &&
-                this.state.messages[e.index]?.content === '等待结果...'
-            )
-            if (entry && this.state.messages[entry.index]) {
-              this.state.messages[entry.index].content = result.length > 500
-                ? result.slice(0, 500) + '...'
-                : result
-            }
-          },
-        })
-      } catch (error) {
-        const idx = this.state.messages.indexOf(assistantPlaceholder)
-        if (idx !== -1) {
-          this.state.messages.splice(idx, 1)
-        }
-        this.state.streamingContent = ''
-        this.state.error.chat = normalizeError(error)
-        this.state.loading.sending = false
-      }
     },
     async refreshSteamData() {
       if (!this.state.selectedProfileId) {
         return
       }
 
-      this.state.loading.steam = true
-      this.state.error.steam = ''
-      try {
-        // Steam overview and deals are independent cards. allSettled lets one
-        // card show data even if the other API fails.
-        const [overviewRes, dealsRes] = await Promise.allSettled([
-          getSteamOverview(this.state.selectedProfileId),
-          getSteamDeals(this.state.selectedProfileId),
-        ])
-
-        if (overviewRes.status === 'fulfilled') {
-          this.state.steamOverview = overviewRes.value.data || createEmptyOverview()
-        } else {
-          this.state.steamOverview = createEmptyOverview()
-          this.state.error.steam = normalizeError(overviewRes.reason)
-        }
-
-        if (dealsRes.status === 'fulfilled') {
-          this.state.steamDeals = dealsRes.value.data || createEmptyDeals()
-        } else {
-          this.state.steamDeals = createEmptyDeals()
-          this.state.error.steam = this.state.error.steam || normalizeError(dealsRes.reason)
-        }
-      } finally {
-        this.state.loading.steam = false
-      }
+      const profileId = this.state.selectedProfileId
+      await this.loadSteamForProfile(profileId)
     },
   },
 }
@@ -539,6 +406,7 @@ a {
 
 .panel--sidebar {
   animation-delay: 0.02s;
+  overflow: auto;
 }
 
 .panel--chat {
@@ -557,10 +425,6 @@ a {
 .steam-stack {
   display: grid;
   gap: 18px;
-}
-
-.panel--sidebar {
-  overflow: auto;
 }
 
 .floating-error {

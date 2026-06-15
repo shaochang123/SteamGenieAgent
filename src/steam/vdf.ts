@@ -1,20 +1,33 @@
-// ============================================================================
-// VDF Parser — reads Valve Data Format files from local Steam installation
-// ============================================================================
-
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { InstalledGame, LibraryFolder } from "../types.js";
 
-/** Detect the default Steam installation path for the current platform */
+const APP_MANIFEST_RE = /^appmanifest_(\d+)\.acf$/;
+type SteamShortcut = { appid: number; name: string; exe: string };
+
+function isNumericKey(key: string): boolean {
+  return !Number.isNaN(Number(key));
+}
+
+function readDir(dir: string): fs.Dirent[] {
+  try { return fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+}
+
 export function detectSteamPath(): string {
+  const configuredPath = process.env.STEAM_PATH?.trim();
+  if (configuredPath) return configuredPath;
+
   switch (process.platform) {
-    case "win32":
-      return path.join(
-        process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
-        "Steam"
-      );
+    case "win32": {
+      const candidates = [
+        path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Steam"),
+        path.join(process.env.ProgramFiles || "C:\\Program Files", "Steam"),
+        "D:\\Steam",
+        "E:\\Steam",
+      ];
+      return candidates.find(isSteamInstallPath) || candidates[0];
+    }
     case "darwin":
       return path.join(
         os.homedir(),
@@ -27,16 +40,27 @@ export function detectSteamPath(): string {
   }
 }
 
-/** Return the steamapps directory */
-export function getSteamAppsPath(steamPath: string): string {
-  return path.join(steamPath, "steamapps");
+function isSteamInstallPath(candidate: string): boolean {
+  return (
+    fs.existsSync(path.join(candidate, "steamapps")) ||
+    fs.existsSync(path.join(candidate, "Steam.exe")) ||
+    fs.existsSync(path.join(candidate, "steam.sh"))
+  );
+}
+
+function getSteamAppsPath(steamPath: string): string {
+  const normalized = path.normalize(steamPath);
+  if (path.basename(normalized).toLowerCase() === "steamapps") {
+    return normalized;
+  }
+  return path.join(normalized, "steamapps");
 }
 
 /**
  * Parse a VDF-formatted string into a plain object.
  * Handles nested objects, quoted strings, and unquoted integers.
  */
-export function parseVdf(content: string): Record<string, unknown> {
+function parseVdf(content: string): Record<string, unknown> {
   let i = 0;
   return parseObject();
 
@@ -110,10 +134,13 @@ export function parseVdf(content: string): Record<string, unknown> {
   }
 }
 
-/** Read and parse libraryfolders.vdf to get all library folders */
 export function getLibraryFolders(steamPath: string): LibraryFolder[] {
   const vdfPath = path.join(getSteamAppsPath(steamPath), "libraryfolders.vdf");
-  if (!fs.existsSync(vdfPath)) return [];
+  if (!fs.existsSync(vdfPath)) {
+    const appsDir = getSteamAppsPath(steamPath);
+    if (!fs.existsSync(appsDir)) return [];
+    return [buildLibraryFolderFromAppsDir(appsDir)];
+  }
 
   const content = fs.readFileSync(vdfPath, "utf-8");
   const parsed = parseVdf(content) as Record<string, unknown>;
@@ -121,7 +148,7 @@ export function getLibraryFolders(steamPath: string): LibraryFolder[] {
 
   const results: LibraryFolder[] = [];
   for (const [key, value] of Object.entries(folders as Record<string, unknown>)) {
-    if (!isNaN(Number(key)) && typeof value === "object" && value !== null) {
+    if (isNumericKey(key) && typeof value === "object" && value !== null) {
       const folder = value as Record<string, unknown>;
       results.push({
         path: String(folder.path || ""),
@@ -132,18 +159,36 @@ export function getLibraryFolders(steamPath: string): LibraryFolder[] {
       });
     }
   }
-  return results;
+  if (results.length > 0) return results;
+  return [buildLibraryFolderFromAppsDir(getSteamAppsPath(steamPath))];
+}
+
+function buildLibraryFolderFromAppsDir(appsDir: string): LibraryFolder {
+  return {
+    path: path.dirname(appsDir),
+    label: "Default",
+    contentid: "",
+    totalsize: 0,
+    apps: collectManifestAppIds(appsDir),
+  };
+}
+
+function collectManifestAppIds(appsDir: string): number[] {
+  return readDir(appsDir)
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name.match(APP_MANIFEST_RE))
+    .filter((match): match is RegExpMatchArray => Boolean(match))
+    .map((match) => Number(match[1]));
 }
 
 function collectAppIds(apps: Record<string, unknown> | undefined): number[] {
   if (!apps) return [];
   return Object.keys(apps)
-    .filter((k) => !isNaN(Number(k)))
+    .filter(isNumericKey)
     .map(Number);
 }
 
-/** Parse a single appmanifest_*.acf file */
-export function parseAppManifest(manifestPath: string): InstalledGame | null {
+function parseAppManifest(manifestPath: string): InstalledGame | null {
   try {
     const content = fs.readFileSync(manifestPath, "utf-8");
     const parsed = parseVdf(content) as Record<string, unknown>;
@@ -163,7 +208,6 @@ export function parseAppManifest(manifestPath: string): InstalledGame | null {
   }
 }
 
-/** Scan all library folders for installed game manifests */
 export function scanInstalledGames(steamPath: string): InstalledGame[] {
   const folders = getLibraryFolders(steamPath);
   const games: InstalledGame[] = [];
@@ -172,16 +216,9 @@ export function scanInstalledGames(steamPath: string): InstalledGame[] {
     const appsDir = path.join(folder.path, "steamapps");
     if (!fs.existsSync(appsDir)) continue;
 
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(appsDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
+    for (const entry of readDir(appsDir)) {
       if (!entry.isFile()) continue;
-      const match = entry.name.match(/^appmanifest_(\d+)\.acf$/);
+      const match = entry.name.match(APP_MANIFEST_RE);
       if (!match) continue;
 
       const manifest = parseAppManifest(path.join(appsDir, entry.name));
@@ -195,34 +232,29 @@ export function scanInstalledGames(steamPath: string): InstalledGame[] {
   return games;
 }
 
-/** Get the shortcuts.vdf path for a given user */
-export function getShortcutsPath(steamPath: string, steamId: string): string {
+function getShortcutsPath(steamPath: string, steamId: string): string {
   // shortcuts.vdf is stored per-user in steam/userdata/<steamid3>/config/
   const steamId3 = BigInt(steamId) & 0xffffffffn;
   return path.join(steamPath, "userdata", String(steamId3), "config", "shortcuts.vdf");
 }
 
-/** Read and parse shortcuts.vdf */
-export function readShortcuts(steamPath: string, steamId: string): Array<{ appid: number; name: string; exe: string }> {
+export function readShortcuts(steamPath: string, steamId: string): SteamShortcut[] {
   const p = getShortcutsPath(steamPath, steamId);
   if (!fs.existsSync(p)) return [];
 
   try {
-    const buf = fs.readFileSync(p);
-    const parsed = parseShortcutsVdf(buf);
-    return parsed;
+    return parseShortcutsVdf(fs.readFileSync(p));
   } catch {
     return [];
   }
 }
 
-/** Custom parser for shortcuts.vdf binary format */
-function parseShortcutsVdf(buf: Buffer): Array<{ appid: number; name: string; exe: string }> {
+function parseShortcutsVdf(buf: Buffer): SteamShortcut[] {
   // shortcuts.vdf uses a custom binary-ish format
   // First 4 bytes: signature (0x00)
   // Then a series of string key-value pairs, null-terminated
   // We do a best-effort parse using a simpler approach for recent Steam versions
-  const results: Array<{ appid: number; name: string; exe: string }> = [];
+  const results: SteamShortcut[] = [];
 
   try {
     const content = buf.toString("utf-8");
@@ -231,7 +263,7 @@ function parseShortcutsVdf(buf: Buffer): Array<{ appid: number; name: string; ex
     const shortcuts = parsed["shortcuts"] as Record<string, unknown> | undefined;
     if (shortcuts) {
       for (const [key, value] of Object.entries(shortcuts)) {
-        if (!isNaN(Number(key)) && typeof value === "object" && value !== null) {
+        if (isNumericKey(key) && typeof value === "object" && value !== null) {
           const entry = value as Record<string, unknown>;
           results.push({
             appid: Number(entry.appid) || -Number(key),
@@ -259,8 +291,8 @@ function parseShortcutsVdf(buf: Buffer): Array<{ appid: number; name: string; ex
       const exe = readString();
       if (!exe) break;
       const appName = readString();
-      const launchOptions = readString();
-      const icon = readString();
+      readString(); // launch options
+      readString(); // icon
 
       results.push({
         appid: -1 * (results.length + 1),

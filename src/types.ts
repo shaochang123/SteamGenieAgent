@@ -1,8 +1,3 @@
-// ============================================================================
-// Steam Genie MCP — Type Definitions
-// ============================================================================
-
-/** A game entry from the Steam library */
 export interface LibraryGame {
   appid: number;
   name: string;
@@ -13,7 +8,6 @@ export interface LibraryGame {
   has_community_visible_stats: boolean;
 }
 
-/** Installed game from local VDF manifest */
 export interface InstalledGame {
   appid: number;
   name: string;
@@ -24,7 +18,6 @@ export interface InstalledGame {
   libraryPath: string;            // which steam library folder
 }
 
-/** A Steam library folder from libraryfolders.vdf */
 export interface LibraryFolder {
   path: string;
   label: string;
@@ -33,7 +26,6 @@ export interface LibraryFolder {
   apps: number[];                 // app IDs in this folder
 }
 
-/** Friend entry */
 export interface SteamFriend {
   steamid: string;
   relationship: string;           // "friend" | "requestrecipient" | "requestsent"
@@ -46,7 +38,6 @@ export interface SteamFriend {
   gameid?: string;                // in-game appid
 }
 
-/** Player achievement */
 export interface PlayerAchievement {
   apiname: string;
   achieved: number;               // 0 or 1
@@ -55,36 +46,16 @@ export interface PlayerAchievement {
   description: string;
 }
 
-/** Game with achievement/play data for session matching */
 export interface GameSessionCandidate {
   appid: number;
   name: string;
   playtime_minutes: number;
   achievementProgress: number;    // 0-100 percentage
-  positiveRatings: number;
-  totalRatings: number;
   ratingPercent: number;
   estimatedHours: number;
   isInstalled: boolean;
 }
 
-/** Inventory item for CS2/Dota2 */
-export interface InventoryItem {
-  appid: number;
-  contextid: string;
-  assetid: string;
-  classid: string;
-  instanceid: string;
-  amount: number;
-  name: string;
-  marketHashName: string;
-  iconUrl: string;
-  tradable: boolean;
-  marketable: boolean;
-  price?: MarketPrice;
-}
-
-/** Steam market price data */
 export interface MarketPrice {
   lowestPrice: string;            // e.g. "$1.23"
   medianPrice: string;
@@ -93,55 +64,12 @@ export interface MarketPrice {
   lastUpdated: string;
 }
 
-/** Store search result */
-export interface StoreSearchResult {
-  appid: number;
-  name: string;
-  type: string;                   // "game" | "dlc" | "demo" etc.
-  currentPrice: number;           // in CNY (or user currency)
-  originalPrice: number;
-  discountPercent: number;
-  headerImage: string;
-  releaseDate: string;
-  platforms: {
-    windows: boolean;
-    mac: boolean;
-    linux: boolean;
-  };
-  metacritic?: { score: number; url: string };
-  reviewSummary: string;          // e.g. "Very Positive"
-  reviewPercent: number;
-}
-
-/** Price history entry */
 export interface PriceHistoryEntry {
   date: string;
   price: number;
   discount: boolean;
 }
 
-/** Screenshot from local Steam data */
-export interface SteamScreenshot {
-  appid: number;
-  gameName: string;
-  filename: string;
-  fullPath: string;
-  width: number;
-  height: number;
-  created: number;
-  size: number;
-}
-
-/** Steam config / server options */
-export interface SteamGenieOptions {
-  steamApiKey?: string;
-  steamId?: string;
-  steamPath?: string;             // custom Steam installation path
-  currency?: string;              // default "CNY"
-  language?: string;              // default "zh-CN"
-}
-
-/** Steam store country-specific price data */
 export interface CountryPrice {
   currency: string;
   initial: number;                // price in smallest unit
@@ -150,7 +78,6 @@ export interface CountryPrice {
   individual: number;             // non-bundle price
 }
 
-/** Full store app details */
 export interface StoreAppDetails {
   appid: number;
   name: string;

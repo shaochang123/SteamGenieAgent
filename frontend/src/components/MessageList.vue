@@ -13,9 +13,9 @@
     >
       <div class="message-bubble">
         <p class="message-label">
-          {{ message.role === 'tool_call' ? '工具调用' : message.role === 'tool_result' ? '工具结果' : message.role === 'assistant' ? 'AI' : '你' }}
+          {{ messageLabel(message.role) }}
         </p>
-        <div v-if="message.role === 'tool_call' || message.role === 'tool_result'" class="message-body message-body--tool">
+        <div v-if="isToolMessage(message.role)" class="message-body message-body--tool">
           {{ message.content }}
         </div>
         <div v-else class="message-body" v-html="renderMarkdown(message.content)"></div>
@@ -40,6 +40,7 @@ const markdown = new MarkdownIt({
   breaks: true,
   linkify: true,
 })
+const MESSAGE_LABELS = { tool_call: '工具调用', tool_result: '工具结果', assistant: 'AI' }
 
 const defaultLinkOpen =
   markdown.renderer.rules.link_open ||
@@ -85,6 +86,8 @@ export default {
     this.scrollToBottom()
   },
   methods: {
+    isToolMessage(role) { return role === 'tool_call' || role === 'tool_result' },
+    messageLabel(role) { return MESSAGE_LABELS[role] || '你' },
     renderMarkdown(content) {
       return markdown.render(content || '')
     },

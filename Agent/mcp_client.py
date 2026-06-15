@@ -1,6 +1,7 @@
 """MCP client manager — spawns the TypeScript MCP server as a subprocess
 and communicates via stdio using the Python MCP SDK."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,11 @@ from typing import Any
 
 # Fields in JSON Schema that Ollama rejects in tool parameters.
 _SCHEMA_REJECTED_KEYS = frozenset({"$schema", "additionalProperties", "title"})
+logger = logging.getLogger("MCP")
+
+
+def _strip_schema_meta(schema: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in schema.items() if key not in _SCHEMA_REJECTED_KEYS}
 
 
 def _clean_schema(params: dict[str, Any]) -> dict[str, Any]:
@@ -17,20 +23,26 @@ def _clean_schema(params: dict[str, Any]) -> dict[str, Any]:
         if key in _SCHEMA_REJECTED_KEYS:
             continue
         if key == "properties" and isinstance(value, dict):
-            cleaned_props: dict[str, Any] = {}
-            for prop_name, prop_schema in value.items():
-                if isinstance(prop_schema, dict):
-                    cleaned_props[prop_name] = {
-                        k: v
-                        for k, v in prop_schema.items()
-                        if k not in _SCHEMA_REJECTED_KEYS
-                    }
-                else:
-                    cleaned_props[prop_name] = prop_schema
-            out[key] = cleaned_props
+            out[key] = {
+                name: _strip_schema_meta(schema) if isinstance(schema, dict) else schema
+                for name, schema in value.items()
+            }
         else:
             out[key] = value
     return out
+
+
+def _tool_value(tool: Any, key: str, default: Any = "") -> Any:
+    if hasattr(tool, key):
+        return getattr(tool, key)
+    return tool.get(key, default) if isinstance(tool, dict) else default
+
+
+async def _safe_exit_context(ctx: Any) -> None:
+    try:
+        await ctx.__aexit__(None, None, None)
+    except Exception:
+        pass
 
 
 class MCPClientManager:
@@ -45,6 +57,10 @@ class MCPClientManager:
     @property
     def tools(self) -> list[Any]:
         return self._tools
+
+    @property
+    def is_running(self) -> bool:
+        return self._session is not None
 
     def _server_path(self) -> Path:
         project_dir = Path(__file__).resolve().parent.parent
@@ -66,6 +82,9 @@ class MCPClientManager:
         env["STEAM_API_KEY"] = steam.get("apiKey", "")
         env["STEAM_ID"] = steam.get("steamId", "")
         env["STEAM_CURRENCY"] = "CNY"
+        steam_path = steam.get("steamPath", "").strip()
+        if steam_path:
+            env["STEAM_PATH"] = steam_path
         proxy = steam.get("proxy", "").strip()
         if proxy:
             env["HTTP_PROXY"] = proxy
@@ -103,16 +122,10 @@ class MCPClientManager:
 
     async def stop(self) -> None:
         if self._session:
-            try:
-                await self._session.__aexit__(None, None, None)
-            except Exception:
-                pass
+            await _safe_exit_context(self._session)
             self._session = None
         if self._ctx:
-            try:
-                await self._ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
+            await _safe_exit_context(self._ctx)
             self._ctx = None
         self._read = None
         self._write = None
@@ -129,25 +142,31 @@ class MCPClientManager:
                 texts.append(block["text"])
         return "\n".join(texts)
 
+    async def ping(self) -> bool:
+        if not self._session:
+            return False
+        try:
+            await self._session.list_tools()
+            return True
+        except Exception:
+            return False
+
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
         for tool in self._tools:
-            params = {}
-            if hasattr(tool, "inputSchema"):
-                params = tool.inputSchema
-            elif isinstance(tool, dict) and "inputSchema" in tool:
-                params = tool["inputSchema"]
-
+            params = _tool_value(tool, "inputSchema", {})
             # Ollama rejects $schema, additionalProperties, and other JSON Schema
             # meta fields that the MCP SDK includes. Strip them to avoid 400 errors.
             if isinstance(params, dict):
                 params = _clean_schema(params)
 
-            name = tool.name if hasattr(tool, "name") else tool.get("name", "")
-            desc = tool.description if hasattr(tool, "description") else tool.get("description", "")
             definitions.append({
                 "type": "function",
-                "function": {"name": name, "description": desc, "parameters": params},
+                "function": {
+                    "name": _tool_value(tool, "name"),
+                    "description": _tool_value(tool, "description"),
+                    "parameters": params,
+                },
             })
         return definitions
 
@@ -174,18 +193,13 @@ class PersistentMCPClientManager:
 
     async def health_check(self) -> bool:
         """Return True if the underlying MCP subprocess is still alive."""
-        if self._manager is None or self._manager._session is None:
+        if self._manager is None:
             return False
-        try:
-            await self._manager._session.list_tools()
-            return True
-        except Exception:
-            return False
+        return await self._manager.ping()
 
     async def ensure_healthy(self) -> None:
         """Restart the MCP subprocess if health check fails."""
         if not await self.health_check():
-            logger = __import__("logging").getLogger("MCP")
             logger.warning("MCP health check failed, restarting subprocess...")
             await self.stop()
             await self.start()
@@ -203,4 +217,4 @@ class PersistentMCPClientManager:
 
     @property
     def is_running(self) -> bool:
-        return self._manager is not None and self._manager._session is not None
+        return self._manager is not None and self._manager.is_running

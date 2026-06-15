@@ -17,7 +17,7 @@
     <MessageList :messages="messages" :loading="sending" :streaming-content="streamingContent" />
 
     <ChatComposer
-      :disabled="!profile || loading"
+      :disabled="!profile || loading || sending"
       :loading="sending"
       @send="$emit('send-message', $event)"
     />
