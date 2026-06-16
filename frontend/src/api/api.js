@@ -1,6 +1,30 @@
 import axios from 'axios'
 
-const API_BASE_URL = process.env.VUE_APP_API_BASE_URL || 'http://127.0.0.1:8000'
+const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000'
+const OLLAMA_PORTS = new Set(['11343', '11434'])
+
+function isOllamaUrl(value) {
+  try {
+    const url = new URL(value)
+    return OLLAMA_PORTS.has(url.port) || url.pathname.includes('/api/chat')
+  } catch {
+    return value.includes(':11343') || value.includes(':11434') || value.includes('/api/chat')
+  }
+}
+
+function apiBaseUrl() {
+  const configured = (process.env.VUE_APP_API_BASE_URL || DEFAULT_API_BASE_URL).replace(/\/+$/, '')
+  if (!isOllamaUrl(configured)) {
+    return configured
+  }
+
+  console.warn(
+    `VUE_APP_API_BASE_URL points to Ollama (${configured}); falling back to FastAPI ${DEFAULT_API_BASE_URL}.`
+  )
+  return DEFAULT_API_BASE_URL
+}
+
+const API_BASE_URL = apiBaseUrl()
 
 const api = axios.create({
   baseURL: API_BASE_URL,

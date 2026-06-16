@@ -36,14 +36,17 @@ COMMUNITY_STATUS = {
 
 
 def _player_status_label(state: int) -> str:
+    """Translate Steam numeric persona state into display text."""
     return PLAYER_STATUS.get(state, "未知")
 
 
 def _community_status_label(state: str) -> str:
+    """Translate Steam community XML status into display text."""
     return COMMUNITY_STATUS.get((state or "").strip().lower(), state or "未知")
 
 
 def _game_image(appid: int, image_hash: str, kind: str = "capsule") -> str:
+    """Build a Steam CDN image URL for a game icon or capsule."""
     if not image_hash:
         return ""
     if kind == "icon":
@@ -52,6 +55,7 @@ def _game_image(appid: int, image_hash: str, kind: str = "capsule") -> str:
 
 
 def _extract_tag(xml: str, tag_name: str) -> str:
+    """Extract plain text or CDATA from one XML tag."""
     match = re.search(rf"<{tag_name}>(.*?)</{tag_name}>", xml, re.DOTALL | re.IGNORECASE)
     if not match:
         return ""
@@ -62,6 +66,7 @@ def _extract_tag(xml: str, tag_name: str) -> str:
 
 class SteamService:
     def __init__(self, settings: dict[str, Any]) -> None:
+        """Initialize Steam API, identity, locale, and proxy settings."""
         self.settings = settings or {}
         steam = self.settings.get("steam", {})
         self.api_key = (steam.get("apiKey") or "").strip()
@@ -72,13 +77,16 @@ class SteamService:
 
     @property
     def has_steam_id(self) -> bool:
+        """Return True when the profile has a SteamID64."""
         return bool(self.steam_id)
 
     @property
     def has_api_key(self) -> bool:
+        """Return True when the profile has a Steam Web API key."""
         return bool(self.api_key)
 
     def _friendly_api_error(self, error: Exception) -> str:
+        """Translate low-level Steam/httpx errors into safe UI messages."""
         if self.proxy and isinstance(error, httpx.ProxyError):
             return f"无法连接 Steam 代理 {self.proxy}，请检查代理地址、端口和协议。"
         if self.proxy and isinstance(error, httpx.ConnectError):
@@ -104,6 +112,7 @@ class SteamService:
         return safe_message or "Steam API 请求失败，请检查网络、代理和 Steam 配置。"
 
     async def _async_fetch_public_profile(self) -> dict[str, Any]:
+        """Fetch public Steam community profile data without an API key."""
         if not self.has_steam_id:
             raise RuntimeError("请先配置 SteamID64。")
 
@@ -158,6 +167,7 @@ class SteamService:
         return await asyncio.gather(summary_task, owned_task, recent_task)
 
     def _recent_game_payload(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Normalize one recently played game for the overview card."""
         appid = item.get("appid", 0)
         return {
             "appid": appid,
@@ -169,6 +179,7 @@ class SteamService:
         }
 
     def _player_profile(self, player: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a Steam player summary into frontend profile fields."""
         return {
             "steamId": player.get("steamid", ""),
             "personaName": player.get("personaname", ""),
@@ -181,6 +192,7 @@ class SteamService:
     def _overview_stats(
         self, owned_games: dict[str, Any], recent_games: dict[str, Any]
     ) -> dict[str, Any]:
+        """Calculate owned and recent playtime statistics for the overview."""
         recent_items = recent_games.get("games", [])
         return {
             "ownedGamesCount": owned_games.get("game_count", 0),
@@ -192,6 +204,7 @@ class SteamService:
         }
 
     def _deal_payload(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Normalize one Steam store special into a card payload."""
         appid = item.get("id")
         return {
             "appid": appid,
@@ -213,6 +226,7 @@ class SteamService:
         stats: dict[str, Any] | None = None,
         recent_games: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """Build the stable overview response shape used by the frontend."""
         return {
             "configured": configured,
             "message": message,
@@ -227,6 +241,7 @@ class SteamService:
         owned_games_raw: dict[str, Any],
         recent_games_raw: dict[str, Any],
     ) -> dict[str, Any]:
+        """Build a complete overview from private Web API responses."""
         player = (summary.get("response", {}).get("players") or [None])[0]
         if not player:
             raise RuntimeError(STEAM_USER_NOT_FOUND_MESSAGE)
@@ -247,6 +262,7 @@ class SteamService:
         )
 
     async def async_get_overview(self) -> dict[str, Any]:
+        """Return the best available Steam overview with public fallback."""
         if not self.has_steam_id:
             return self._overview_payload(
                 configured=False,
@@ -288,6 +304,7 @@ class SteamService:
             )
 
     async def async_get_deals(self) -> dict[str, Any]:
+        """Return current Steam store specials for the configured locale."""
         try:
             url = append_query(
                 f"{STEAM_STORE_BASE}/api/featuredcategories/",

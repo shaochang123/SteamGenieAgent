@@ -11,6 +11,7 @@ _async_client: httpx.AsyncClient | None = None
 
 
 def _get_async_client() -> httpx.AsyncClient:
+    """Return the shared async HTTP client used for ordinary requests."""
     global _async_client
     if _async_client is None or _async_client.is_closed:
         _async_client = httpx.AsyncClient(
@@ -21,6 +22,7 @@ def _get_async_client() -> httpx.AsyncClient:
 
 
 async def close_async_client() -> None:
+    """Close the shared async HTTP client during FastAPI shutdown."""
     global _async_client
     if _async_client is not None and not _async_client.is_closed:
         await _async_client.aclose()
@@ -28,6 +30,7 @@ async def close_async_client() -> None:
 
 
 def append_query(url: str, **params: Any) -> str:
+    """Append non-empty query parameters to a URL."""
     filtered = {
         key: value
         for key, value in params.items()

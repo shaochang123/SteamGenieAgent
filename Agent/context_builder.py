@@ -24,6 +24,7 @@ WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 def active_model_name(settings: dict[str, Any]) -> str:
+    """Return the model name for the active AI provider settings."""
     ai_settings = settings.get("ai", {})
     provider = ai_settings.get("provider", "ollama")
     key = "openaiCompatible" if provider == "openai-compatible" else "ollama"
@@ -43,6 +44,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def score_tokens(text: str) -> list[str]:
+    """Extract normalized terms used for lightweight TF-IDF scoring."""
     return [
         token.lower()
         for token in SCORE_TOKEN_RE.findall(text)
@@ -51,6 +53,7 @@ def score_tokens(text: str) -> list[str]:
 
 
 def rank_context_blocks(question: str, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank knowledge and history blocks by relevance to the user question."""
     query_terms = Counter(score_tokens(question))
     if not blocks or not query_terms:
         return sorted(blocks, key=lambda item: item["fallback"], reverse=True)
@@ -75,22 +78,27 @@ def rank_context_blocks(question: str, blocks: list[dict[str, Any]]) -> list[dic
 
 
 def split_knowledge_blocks(context: str) -> list[str]:
+    """Split retrieved knowledge text into independently budgeted blocks."""
     return [part.strip() for part in context.split("\n\n") if part.strip()]
 
 
 def render_knowledge_context(blocks: list[str]) -> str:
+    """Render selected knowledge blocks for the system prompt."""
     return "## Knowledge Base (retrieved references)\n" + "\n\n".join(blocks) + "\n" if blocks else ""
 
 
 def render_history_context(blocks: list[str]) -> str:
+    """Render selected chat history blocks for the system prompt."""
     return "## Conversation History\n" + "\n".join(blocks) + "\n" if blocks else ""
 
 
 def token_limit(settings: dict[str, Any]) -> int:
+    """Return the configured context limit for the active model."""
     return int(model_max_token.get(active_model_name(settings), max_token))
 
 
 def message_token_count(prompt_text: str, question: str) -> int:
+    """Estimate total tokens for the system prompt plus current question."""
     return estimate_tokens(prompt_text) + estimate_tokens(question)
 
 
@@ -98,6 +106,7 @@ def make_context_candidates(
     knowledge_blocks: list[str],
     history_blocks: list[str],
 ) -> list[dict[str, Any]]:
+    """Combine knowledge and history into scored context candidates."""
     candidates: list[dict[str, Any]] = []
     for index, text in enumerate(knowledge_blocks):
         candidates.append({
@@ -122,7 +131,9 @@ def render_selected_context(
     selected_knowledge: list[dict[str, Any]],
     selected_history: list[dict[str, Any]],
 ) -> tuple[str, str]:
+    """Render selected context blocks while preserving original order."""
     def ordered_text(blocks: list[dict[str, Any]]) -> list[str]:
+        """Return selected block text ordered as it originally appeared."""
         return [item["text"] for item in sorted(blocks, key=lambda item: item["order"])]
 
     return (
@@ -139,6 +150,7 @@ def select_context_for_budget(
     history_blocks: list[str],
     settings: dict[str, Any],
 ) -> tuple[str, str]:
+    """Select the most relevant context blocks that fit the model budget."""
     limit = token_limit(settings)
     empty_prompt = prompt_template.format(knowledge_context="", history_context="")
     if message_token_count(empty_prompt, question) > limit:
@@ -167,6 +179,7 @@ def select_context_for_budget(
 
 
 def history_context_blocks(messages: list[dict[str, Any]]) -> list[str]:
+    """Convert recent chat history into prompt-safe context blocks."""
     blocks: list[str] = []
     for message in messages[-10:]:
         role = message.get("role", "")
@@ -192,6 +205,7 @@ def build_prompt_messages(
     settings: dict[str, Any],
     has_tools: bool,
 ) -> list[dict[str, str]]:
+    """Build provider chat messages with budgeted RAG and history context."""
     prompt_template = system_prompt_with_tools if has_tools else system_prompt
     knowledge_context, history_context = select_context_for_budget(
         question=question,

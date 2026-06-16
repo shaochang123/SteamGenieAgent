@@ -12,54 +12,50 @@ export function registerMarketTools(
 ) {
   server.tool(
     "search_store",
-    "搜索 Steam 商店中的游戏、DLC 或软件。",
+    "Search the Steam store for games, DLC, or software by keyword.",
     {
-      query: z.string().describe("搜索关键词"),
+      query: z.string().describe("Search keyword or game title."),
       country: z
         .string()
         .optional()
         .default("CN")
-        .describe("国家代码，默认 CN"),
+        .describe("Country code. Defaults to CN."),
     },
     async ({ query, country }) => {
       const results = await market.searchStore(query, country);
 
       if (results.length === 0) {
-        return textResult(`未找到与 "${query}" 相关的结果。`);
+        return textResult(`No Steam store results found for "${query}".`);
       }
 
       const lines = results.slice(0, 20).map(
         (r) =>
-          `- **${r.name}** (AppID: ${r.appid})\n  🔗 ${steamStoreUrl(r.appid)}`
+          `- **${r.name}** (AppID: ${r.appid})\n  ${steamStoreUrl(r.appid)}`
       );
 
-      return textResult(`🔍 搜索 "${query}" 的结果 (${results.length} 个)：
-
-${lines.join("\n")}
-
-💡 使用 get_game_details 查看具体游戏的详细信息。`);
+      return textResult(`Search results for "${query}" (${results.length} total):\n\n${lines.join("\n")}\n\nUse get_game_details with an AppID to inspect a specific game.`);
     }
   );
 
   server.tool(
     "get_deals",
-    "获取 Steam 当前打折促销的游戏列表。",
+    "List current Steam store deals and optionally filter by minimum discount.",
     {
       country: z
         .string()
         .optional()
         .default("CN")
-        .describe("国家代码"),
+        .describe("Country code. Defaults to CN."),
       min_discount: z
         .number()
         .optional()
         .default(0)
-        .describe("最低折扣百分比，如 50 表示至少半价"),
+        .describe("Minimum discount percentage. For example, 50 means at least 50% off."),
       limit: z
         .number()
         .optional()
         .default(20)
-        .describe("返回数量"),
+        .describe("Maximum number of deals to return."),
     },
     async ({ country, min_discount, limit }) => {
       const deals = await market.getFeaturedDeals(country);
@@ -69,37 +65,35 @@ ${lines.join("\n")}
         .slice(0, limit);
 
       if (filtered.length === 0) {
-        return textResult("当前没有符合条件的促销活动。");
+        return textResult("No current Steam deals match the requested filters.");
       }
 
       const lines = filtered.map(
         (d) =>
-          `- **${d.name}** — ${formatCny(d.finalPrice)} (原价 ${formatCny(d.originalPrice)} | ${d.discountPercent}% OFF)\n  🔗 ${steamStoreUrl(d.appid)}`
+          `- **${d.name}** - ${formatCny(d.finalPrice)} (original ${formatCny(d.originalPrice)} | ${d.discountPercent}% off)\n  ${steamStoreUrl(d.appid)}`
       );
 
-      return textResult(`🛒 **Steam 特惠** (${filtered.length} 款折扣游戏)
-
-${lines.join("\n")}`);
+      return textResult(`Steam deals (${filtered.length} games):\n\n${lines.join("\n")}`);
     }
   );
 
   server.tool(
     "monitor_price",
-    "查看一款游戏的当前价格，并与历史价格对比，判断是否处于史低。",
+    "Check the current Steam price for a game and compare it with locally recorded price history.",
     {
-      appid: z.number().describe("Steam 游戏的 AppID"),
+      appid: z.number().describe("Steam AppID."),
       country: z
         .string()
         .optional()
         .default("CN")
-        .describe("国家代码"),
+        .describe("Country code. Defaults to CN."),
     },
     async ({ appid, country }) => {
       const details = await api.getStoreAppDetails(appid, country);
       const history = await market.getPriceHistory(appid);
 
       if (!details) {
-        return textResult(`无法获取 AppID ${appid} 的信息。`);
+        return textResult(`Unable to fetch information for AppID ${appid}.`);
       }
 
       const priceNow = details.price_overview;
@@ -107,46 +101,42 @@ ${lines.join("\n")}`);
 
       if (priceNow) {
         if (details.is_free) {
-          analysis = "🆓 此游戏免费！";
+          analysis = "This game is free.";
         } else if (priceNow.discount_percent > 0) {
-          analysis = `🔥 正在打折！折扣 ${priceNow.discount_percent}%
-当前价格：${formatCnyCents(priceNow.final)}
-原价：${formatCnyCents(priceNow.initial)}
-节省：${formatCnyCents(priceNow.initial - priceNow.final)}`;
+          analysis = `Discount active: ${priceNow.discount_percent}% off
+Current price: ${formatCnyCents(priceNow.final)}
+Original price: ${formatCnyCents(priceNow.initial)}
+Savings: ${formatCnyCents(priceNow.initial - priceNow.final)}`;
 
           if (priceNow.discount_percent >= 75) {
-            analysis += "\n\n🏆 **这是大折扣！可能是史低价格，建议入手！**";
+            analysis += "\n\nThis is a deep discount and may be worth buying if the game is on your wishlist.";
           }
         } else {
-          analysis = `当前价格：${formatCnyCents(priceNow.final)}
-⚠️ 目前没有折扣。建议加入愿望单等待促销。`;
+          analysis = `Current price: ${formatCnyCents(priceNow.final)}
+No discount is active. Consider waiting for a sale if you are price-sensitive.`;
         }
       } else {
-        analysis = "价格信息不可用。此游戏可能尚未定价或已下架。";
+        analysis = "Price information is unavailable. The game may be unpriced or removed from the store.";
       }
 
       const historyStr =
         history.length > 0
-          ? `\n\n**近期价格记录：**\n${history
-              .map((h) => `- ${h.date}: ${formatCny(h.price)}${h.discount ? " (折扣)" : ""}`)
+          ? `\n\n**Recent price records:**\n${history
+              .map((h) => `- ${h.date}: ${formatCny(h.price)}${h.discount ? " (discounted)" : ""}`)
               .join("\n")}`
           : "";
 
-      return textResult(`📈 **${details.name}** 价格监测
-
-${analysis}${historyStr}
-
-🔗 [Steam 商店](${steamStoreUrl(appid)})`);
+      return textResult(`**${details.name}** price monitor\n\n${analysis}${historyStr}\n\n[Steam store](${steamStoreUrl(appid)})`);
     }
   );
 
   server.tool(
     "check_price",
-    "快速查看一个或多个 Steam 游戏的中国区当前价格。",
+    "Quickly check current CN-region Steam prices for one or more games.",
     {
       appids: z
         .array(z.number())
-        .describe("游戏 AppID 列表，如 [730, 570, 1172470]"),
+        .describe("Steam AppID list, for example [730, 570, 1172470]."),
     },
     async ({ appids }) => {
       const results: string[] = [];
@@ -156,21 +146,19 @@ ${analysis}${historyStr}
         if (details) {
           const price = details.price_overview;
           const priceStr = details.is_free
-            ? "免费 🆓"
+            ? "Free"
             : price
-              ? `${formatCnyCents(price.final)}${price.discount_percent > 0 ? ` (${price.discount_percent}% OFF)` : ""}`
-              : "未知";
+              ? `${formatCnyCents(price.final)}${price.discount_percent > 0 ? ` (${price.discount_percent}% off)` : ""}`
+              : "Unknown";
           results.push(
-            `- **${details.name}**: ${priceStr}\n  🔗 ${steamStoreUrl(appid)}`
+            `- **${details.name}**: ${priceStr}\n  ${steamStoreUrl(appid)}`
           );
         } else {
-          results.push(`- AppID ${appid}: 无法获取信息`);
+          results.push(`- AppID ${appid}: unable to fetch price information.`);
         }
       }
 
-      return textResult(`💰 **Steam 国区价格查询**
-
-${results.join("\n")}`);
+      return textResult(`Steam CN price check\n\n${results.join("\n")}`);
     }
   );
 }

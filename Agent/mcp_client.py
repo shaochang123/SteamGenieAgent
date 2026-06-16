@@ -13,6 +13,7 @@ logger = logging.getLogger("MCP")
 
 
 def _strip_schema_meta(schema: dict[str, Any]) -> dict[str, Any]:
+    """Remove JSON Schema keys that are not accepted by all LLM providers."""
     return {key: value for key, value in schema.items() if key not in _SCHEMA_REJECTED_KEYS}
 
 
@@ -33,12 +34,14 @@ def _clean_schema(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_value(tool: Any, key: str, default: Any = "") -> Any:
+    """Read a tool attribute from MCP SDK objects or dictionary fallbacks."""
     if hasattr(tool, key):
         return getattr(tool, key)
     return tool.get(key, default) if isinstance(tool, dict) else default
 
 
 async def _safe_exit_context(ctx: Any) -> None:
+    """Exit an async context manager without raising cleanup failures."""
     try:
         await ctx.__aexit__(None, None, None)
     except Exception:
@@ -47,6 +50,7 @@ async def _safe_exit_context(ctx: Any) -> None:
 
 class MCPClientManager:
     def __init__(self, profile: dict[str, Any]) -> None:
+        """Create a profile-bound manager for one MCP stdio subprocess."""
         self._profile = profile
         self._session = None
         self._tools: list[Any] = []
@@ -56,13 +60,16 @@ class MCPClientManager:
 
     @property
     def tools(self) -> list[Any]:
+        """Return the MCP tools discovered during startup."""
         return self._tools
 
     @property
     def is_running(self) -> bool:
+        """Return True when a Python MCP session is currently open."""
         return self._session is not None
 
     def _server_path(self) -> Path:
+        """Resolve the built JavaScript server or TypeScript dev entrypoint."""
         project_dir = Path(__file__).resolve().parent.parent
         src_dir = project_dir / "src"
         dist_js = project_dir / "dist" / "index.js"
@@ -77,6 +84,7 @@ class MCPClientManager:
         )
 
     def _build_env(self) -> dict[str, str]:
+        """Build the MCP subprocess environment from profile Steam settings."""
         env = os.environ.copy()
         steam = self._profile.get("steam", {})
         env["STEAM_API_KEY"] = steam.get("apiKey", "")
@@ -92,6 +100,7 @@ class MCPClientManager:
         return env
 
     async def start(self) -> list[Any]:
+        """Start the MCP subprocess and load its tool definitions."""
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
@@ -121,6 +130,7 @@ class MCPClientManager:
         return self._tools
 
     async def stop(self) -> None:
+        """Stop the MCP session and close the stdio transport."""
         if self._session:
             await _safe_exit_context(self._session)
             self._session = None
@@ -131,6 +141,7 @@ class MCPClientManager:
         self._write = None
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """Call one MCP tool and flatten text result blocks."""
         if not self._session:
             raise RuntimeError("MCP client not started. Call start() first.")
         result = await self._session.call_tool(name, arguments)
@@ -143,6 +154,7 @@ class MCPClientManager:
         return "\n".join(texts)
 
     async def ping(self) -> bool:
+        """Return True if the MCP subprocess still responds to list_tools."""
         if not self._session:
             return False
         try:
@@ -152,6 +164,7 @@ class MCPClientManager:
             return False
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
+        """Convert MCP tool metadata into OpenAI/Ollama function schemas."""
         definitions: list[dict[str, Any]] = []
         for tool in self._tools:
             params = _tool_value(tool, "inputSchema", {})
@@ -177,16 +190,19 @@ class PersistentMCPClientManager:
     auto-restarts the subprocess if it has died."""
 
     def __init__(self, profile: dict[str, Any]) -> None:
+        """Create a lazy persistent manager for one profile."""
         self._profile = profile
         self._manager: MCPClientManager | None = None
 
     async def start(self) -> list[Any]:
+        """Start the subprocess once or return already loaded tools."""
         if self._manager is not None:
             return self._manager.tools
         self._manager = MCPClientManager(self._profile)
         return await self._manager.start()
 
     async def stop(self) -> None:
+        """Stop and forget the cached MCP subprocess manager."""
         if self._manager is not None:
             await self._manager.stop()
             self._manager = None
@@ -205,16 +221,19 @@ class PersistentMCPClientManager:
             await self.start()
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """Ensure the subprocess is healthy before calling a tool."""
         await self.ensure_healthy()
         if self._manager is None:
             raise RuntimeError("MCP client not started.")
         return await self._manager.call_tool(name, arguments)
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
+        """Return provider-ready tool definitions for the active subprocess."""
         if self._manager is None:
             return []
         return self._manager.get_tool_definitions()
 
     @property
     def is_running(self) -> bool:
+        """Return True when the persistent subprocess is available."""
         return self._manager is not None and self._manager.is_running

@@ -31,12 +31,14 @@ def should_buffer_tool_markup(text: str) -> bool:
 
 
 def hide_tool_markup(role: str, content: str) -> str:
+    """Replace raw assistant tool-call markup with a safe UI message."""
     if role == "assistant" and looks_like_tool_markup(content):
         return HIDDEN_TOOL_MARKUP_MESSAGE
     return content
 
 
 def tool_markup_fallback(tool_history: list[dict[str, Any]]) -> str:
+    """Build a fallback answer when a model prints tool calls as text."""
     recent_results = [
         entry.get("content", "")
         for entry in tool_history

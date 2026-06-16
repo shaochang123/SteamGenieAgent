@@ -1,5 +1,7 @@
 # SteamGenieMcp
 
+详细模块图和系统架构图：[Architecture](./docs/architecture.md)
+
 一个本地运行的 Steam AI 工作台，包含 Vue 2 前端界面、FastAPI 后端、按用户隔离的会话记忆，以及 Steam 个人资料和商店卡片。
 
 查看 [配置](./INSTALL_CN.md) 以配置项目

@@ -38,6 +38,7 @@ _mcp_pool: dict[str, PersistentMCPClientManager] = {}
 
 
 async def get_or_create_mcp_client(profile_id: str) -> PersistentMCPClientManager | None:
+    """Return a cached MCP client when the profile has usable Steam settings."""
     profile = store.get_profile(profile_id)
     steam = profile.get("steam", {})
     api_key = steam.get("apiKey", "")
@@ -84,12 +85,14 @@ async def get_or_create_mcp_client(profile_id: str) -> PersistentMCPClientManage
 
 
 async def invalidate_mcp_client(profile_id: str) -> None:
+    """Stop and remove a cached MCP client after profile settings change."""
     manager = _mcp_pool.pop(profile_id, None)
     if manager is not None:
         await manager.stop()
 
 
 async def stop_all_mcp_clients() -> None:
+    """Stop every cached MCP subprocess during application shutdown."""
     for profile_id in list(_mcp_pool.keys()):
         manager = _mcp_pool.pop(profile_id)
         await manager.stop()
@@ -97,6 +100,7 @@ async def stop_all_mcp_clients() -> None:
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
+    """Clean up shared MCP and HTTP resources when FastAPI exits."""
     yield
     await stop_all_mcp_clients()
     await close_async_client()
@@ -157,6 +161,7 @@ def require_question(question: str) -> str:
 
 
 async def build_chat_agent(profile_id: str) -> Agent:
+    """Create an Agent with an optional MCP client for streaming chat."""
     # Steam/MCP tools are optional. Missing credentials return None and the
     # agent falls back to plain RAG + history chat.
     mcp_client = await get_or_create_mcp_client(profile_id)
@@ -164,10 +169,12 @@ async def build_chat_agent(profile_id: str) -> Agent:
 
 
 def sse_event(event: dict[str, Any]) -> str:
+    """Encode one event dictionary as an SSE data frame."""
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 async def collect_chat_answer(agent: Agent, question: str, k: int) -> str:
+    """Collect a streaming chat response into a single string."""
     answer = ""
     async for event in agent.chat_stream(question=question, k=k):
         event_type = event.get("type")
@@ -181,16 +188,19 @@ async def collect_chat_answer(agent: Agent, question: str, k: int) -> str:
 
 
 def profile_steam_service(profile_id: str) -> SteamService:
+    """Build a Steam service from one profile's stored settings."""
     return SteamService(resolve_profile(profile_id))
 
 
 @app.get("/")
 async def root() -> dict[str, Any]:
+    """Return a minimal health payload for the API root."""
     return {"message": "server running", "profiles": len(store.list_profiles())}
 
 
 @app.get("/mcp/status")
 async def mcp_status() -> dict[str, Any]:
+    """Return profile-scoped MCP subprocess status for diagnostics."""
     result: dict[str, Any] = {}
     for pid in (p["id"] for p in store.list_profiles()):
         profile = store.get_profile(pid)
@@ -208,11 +218,13 @@ async def mcp_status() -> dict[str, Any]:
 
 @app.get("/profiles")
 async def list_profiles() -> dict[str, Any]:
+    """Return sidebar profile summaries."""
     return {"profiles": store.list_profiles()}
 
 
 @app.post("/profiles")
 async def create_profile(req: CreateProfileRequest) -> dict[str, Any]:
+    """Create a new local profile from a display name."""
     try:
         profile = store.create_profile(req.displayName)
         return {"profile": profile}
@@ -224,11 +236,13 @@ async def create_profile(req: CreateProfileRequest) -> dict[str, Any]:
 
 @app.get("/profiles/{profile_id}")
 async def get_profile(profile_id: str) -> dict[str, Any]:
+    """Return a full profile config for the settings UI."""
     return {"profile": resolve_profile(profile_id)}
 
 
 @app.delete("/profiles/{profile_id}")
 async def delete_profile(profile_id: str) -> dict[str, Any]:
+    """Delete a profile and invalidate its cached MCP subprocess."""
     resolve_profile(profile_id)
     store.delete_profile(profile_id)
     await invalidate_mcp_client(profile_id)
@@ -237,6 +251,7 @@ async def delete_profile(profile_id: str) -> dict[str, Any]:
 
 @app.patch("/profiles/{profile_id}/config")
 async def update_profile_config(profile_id: str, req: ProfileConfigRequest) -> dict[str, Any]:
+    """Persist profile settings and restart MCP tools on the next request."""
     resolve_profile(profile_id)
     try:
         profile = store.update_profile_config(profile_id, ai=req.ai, steam=req.steam)
@@ -250,12 +265,14 @@ async def update_profile_config(profile_id: str, req: ProfileConfigRequest) -> d
 
 @app.get("/profiles/{profile_id}/messages")
 async def get_profile_messages(profile_id: str) -> dict[str, Any]:
+    """Return normalized chat history for one profile."""
     resolve_profile(profile_id)
     return {"messages": store.load_messages(profile_id)}
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest) -> dict[str, Any]:
+    """Run a chat turn and return the final answer as JSON."""
     question = require_question(req.question)
     agent = await build_chat_agent(req.profileId)
 
@@ -276,10 +293,12 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
+    """Stream a chat turn to the browser as Server-Sent Events."""
     question = require_question(req.question)
     agent = await build_chat_agent(req.profileId)
 
     async def event_generator():
+        """Yield serialized SSE frames from the Agent event stream."""
         try:
             # chat_stream handles both MCP and non-MCP paths
             # using fully async I/O — never blocks the event loop.
@@ -296,21 +315,25 @@ async def chat_stream(req: ChatRequest):
 
 @app.get("/profiles/{profile_id}/steam/overview")
 async def get_steam_overview(profile_id: str) -> dict[str, Any]:
+    """Return Steam profile, status, and recent-play summary data."""
     return await profile_steam_service(profile_id).async_get_overview()
 
 
 @app.get("/profiles/{profile_id}/steam/deals")
 async def get_steam_deals(profile_id: str) -> dict[str, Any]:
+    """Return Steam store deal cards using the profile's region settings."""
     return await profile_steam_service(profile_id).async_get_deals()
 
 
 @app.get("/profiles/{profile_id}/knowledge")
 async def get_knowledge(profile_id: str) -> dict[str, Any]:
+    """Return public and profile-owned knowledge file metadata."""
     resolve_profile(profile_id)
     return store.list_knowledge_files(profile_id)
 
 
 async def read_knowledge_upload(file: UploadFile) -> tuple[str, bytes, str]:
+    """Read and validate an uploaded JSON knowledge file."""
     filename = file.filename or ""
     if not filename.lower().endswith(".json"):
         raise HTTPException(status_code=400, detail="仅支持上传 .json 文件。")
@@ -336,6 +359,7 @@ async def read_knowledge_upload(file: UploadFile) -> tuple[str, bytes, str]:
 
 @app.post("/profiles/{profile_id}/knowledge")
 async def upload_knowledge(profile_id: str, file: UploadFile):
+    """Save, index, and expose one profile-owned knowledge upload."""
     resolve_profile(profile_id)
     filename, content, knowledge_text = await read_knowledge_upload(file)
 
@@ -360,6 +384,7 @@ async def upload_knowledge(profile_id: str, file: UploadFile):
 
 @app.delete("/profiles/{profile_id}/knowledge/{filename}")
 async def delete_knowledge(profile_id: str, filename: str) -> dict[str, Any]:
+    """Delete one profile-owned knowledge file and its vector/md5 entries."""
     resolve_profile(profile_id)
     try:
         knowledge_text = store.read_knowledge_file(profile_id, filename)

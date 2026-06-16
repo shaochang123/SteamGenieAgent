@@ -57,11 +57,11 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Log startup info to stderr (won't interfere with MCP protocol on stdout)
-  console.error(" Steam Genie MCP Server started");
+  // Log startup info to stderr so stdout remains valid MCP protocol traffic.
+  console.error("Steam Genie MCP Server started");
   console.error(`   Steam Path: ${config.steamPath}`);
-  console.error(`   API Key: ${config.apiKey ? "✓ configured" : "✗ not set (some features limited)"}`);
-  console.error(`   Steam ID: ${config.steamId || "✗ not set"}`);
+  console.error(`   API Key: ${config.apiKey ? "configured" : "not set (some features limited)"}`);
+  console.error(`   Steam ID: ${config.steamId || "not set"}`);
   console.error(`   Currency: ${config.currency}`);
 }
 

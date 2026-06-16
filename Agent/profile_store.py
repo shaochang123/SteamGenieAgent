@@ -55,7 +55,11 @@ def clean_setting(
     key: str,
     default: str = "",
 ) -> str:
-    return source.get(key, current.get(key, default)).strip()
+    """Read a settings field while preserving explicit empty-string clears."""
+    value = source[key] if key in source else current.get(key, default)
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def clean_settings(
@@ -63,6 +67,7 @@ def clean_settings(
     current: dict[str, Any],
     defaults: dict[str, str],
 ) -> dict[str, str]:
+    """Normalize a settings section without overwriting deliberate blank fields."""
     return {
         key: clean_setting(source, current, key, default)
         for key, default in defaults.items()
@@ -70,15 +75,41 @@ def clean_settings(
 
 
 def safe_filename(filename: str) -> str:
+    """Return only the basename part of a browser-provided filename."""
     return filename.replace("\\", "/").split("/")[-1]
 
 
 def profile_md5_path(profile_id: str) -> Path:
+    """Return the per-profile md5 marker file path."""
     return Path(md5_path).parent / "md5" / f"{profile_id}.txt"
+
+
+def has_required_settings(settings: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    """Return True when all required keys contain non-empty text."""
+    return all(str(settings.get(key) or "").strip() for key in keys)
+
+
+def validate_ai_config(ai: dict[str, Any]) -> None:
+    """Validate that the active AI provider has enough settings to answer."""
+    provider = ai.get("provider", "ollama")
+    if provider == "ollama":
+        if not has_required_settings(ai.get("ollama", {}), ("baseUrl", "model")):
+            raise ValueError("选择 Ollama 时需要填写 Base URL 和 Model。")
+        return
+
+    if provider == "openai-compatible":
+        if not has_required_settings(
+            ai.get("openaiCompatible", {}), ("apiKey", "baseUrl", "model")
+        ):
+            raise ValueError("选择 OpenAI 兼容接口时需要填写 API Key、Base URL 和 Model。")
+        return
+
+    raise ValueError("不支持的 AI provider。")
 
 
 class ProfileStore:
     def __init__(self) -> None:
+        """Initialize runtime paths and ensure local storage is ready."""
         self.runtime_path = Path(runtime_path)
         self.profiles_path = Path(profiles_path)
         self.history_path = Path(history_path)
@@ -140,18 +171,22 @@ class ProfileStore:
         }
 
     def profile_path(self, profile_id: str) -> Path:
+        """Return the JSON config path for a profile."""
         return self.profiles_path / f"{profile_id}.json"
 
     def history_file_path(self, profile_id: str) -> Path:
+        """Return the chat history path for a profile."""
         return self.history_path / f"{profile_id}.json"
 
     def _read_json(self, path: Path, default: Any) -> Any:
+        """Read JSON from disk or return a default when the file is missing."""
         if not path.exists():
             return default
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 
     def _write_json(self, path: Path, payload: Any) -> None:
+        """Write formatted UTF-8 JSON to disk, creating parent directories."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -183,6 +218,7 @@ class ProfileStore:
         return profiles
 
     def _has_ai_config(self, profile: dict[str, Any]) -> bool:
+        """Return True when the active provider has required settings."""
         ai = profile.get("ai", {})
         provider = ai.get("provider", "ollama")
         if provider == "openai-compatible":
@@ -192,6 +228,7 @@ class ProfileStore:
         return all(settings.get(key) for key in ("baseUrl", "model"))
 
     def create_profile(self, display_name: str) -> dict[str, Any]:
+        """Create a new local profile and empty history file."""
         cleaned = display_name.strip()
         if not cleaned:
             raise ValueError("用户名不能为空。")
@@ -206,12 +243,14 @@ class ProfileStore:
         return profile
 
     def get_profile(self, profile_id: str) -> dict[str, Any]:
+        """Load a profile config or raise when it does not exist."""
         profile = self._read_json(self.profile_path(profile_id), None)
         if not isinstance(profile, dict):
             raise FileNotFoundError("用户不存在。")
         return profile
 
     def delete_profile(self, profile_id: str) -> None:
+        """Delete a profile and all profile-owned runtime sidecars."""
         profile_path = self.profile_path(profile_id)
         history_file = self.history_file_path(profile_id)
         knowledge_dir = Path(user_knowledge_path) / profile_id
@@ -238,7 +277,7 @@ class ProfileStore:
         """Merge partial settings updates without resetting unrelated sections."""
         profile = self.get_profile(profile_id)
 
-        if ai:
+        if ai is not None:
             profile_ai = profile.setdefault("ai", {})
             provider = ai.get("provider") or profile_ai.get("provider", "ollama")
             if provider not in SUPPORTED_AI_PROVIDERS:
@@ -253,7 +292,9 @@ class ProfileStore:
                 current = profile_ai.setdefault("openaiCompatible", {})
                 current.update(clean_settings(ai["openaiCompatible"], current, OPENAI_DEFAULTS))
 
-        if steam:
+            validate_ai_config(profile_ai)
+
+        if steam is not None:
             profile_steam = profile.setdefault("steam", {})
             profile_steam.update(clean_settings(steam, profile_steam, STEAM_DEFAULTS))
             profile_steam["country"] = profile_steam["country"] or steam_country
@@ -264,6 +305,7 @@ class ProfileStore:
         return profile
 
     def _chat_message(self, role: str, content: str, timestamp: str | None = None) -> dict[str, Any]:
+        """Build one normalized chat message record."""
         return {"role": role, "content": content, "timestamp": timestamp or utc_now()}
 
     def _normalize_message(self, item: Any) -> dict[str, Any] | None:
@@ -302,17 +344,21 @@ class ProfileStore:
         return normalized
 
     def save_messages(self, profile_id: str, messages: list[dict[str, Any]]) -> None:
+        """Persist normalized chat messages for one profile."""
         self._write_json(self.history_file_path(profile_id), messages)
 
     def knowledge_dir(self, profile_id: str) -> Path:
+        """Return and create the profile-owned knowledge upload directory."""
         dir_path = Path(user_knowledge_path) / profile_id
         dir_path.mkdir(parents=True, exist_ok=True)
         return dir_path
 
     def _knowledge_file_path(self, profile_id: str, filename: str) -> Path:
+        """Return a safe path for one profile-owned knowledge file."""
         return self.knowledge_dir(profile_id) / safe_filename(filename)
 
     def list_knowledge_files(self, profile_id: str) -> dict[str, list[dict[str, Any]]]:
+        """List public and profile-owned knowledge files for the UI."""
         public_files: list[dict[str, Any]] = []
         public_dir = Path(knowledge_path)
         if public_dir.exists():
@@ -332,6 +378,7 @@ class ProfileStore:
         return {"public": public_files, "user": user_files}
 
     def save_knowledge_file(self, profile_id: str, filename: str, content: bytes) -> Path:
+        """Validate and save one uploaded profile knowledge JSON file."""
         # Only keep the basename from the browser-provided filename. This blocks
         # path traversal while still preserving the user's visible file name.
         safe_name = safe_filename(filename)
@@ -346,12 +393,14 @@ class ProfileStore:
         return target
 
     def read_knowledge_file(self, profile_id: str, filename: str) -> str:
+        """Read a profile-owned knowledge file as UTF-8 text."""
         target = self._knowledge_file_path(profile_id, filename)
         if not target.exists():
             raise FileNotFoundError("文件不存在。")
         return target.read_text(encoding="utf-8")
 
     def delete_knowledge_file(self, profile_id: str, filename: str) -> None:
+        """Delete one profile-owned knowledge file from runtime storage."""
         target = self._knowledge_file_path(profile_id, filename)
         if not target.exists():
             raise FileNotFoundError("文件不存在。")

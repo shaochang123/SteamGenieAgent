@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
+from urllib.parse import urlparse
 
 import httpx
 from langchain_chroma import Chroma
@@ -22,8 +23,6 @@ from config import (
     llm_http_timeout,
     max_split_char_number,
     md5_path,
-    model_name,
-    ollama_base_url,
     separators,
     user_knowledge_path,
     vector_path,
@@ -49,10 +48,12 @@ MAX_TOOL_TURNS = 5
 
 
 def utc_now() -> str:
+    """Return an ISO timestamp for chat and knowledge metadata."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _llm_timeout_message(provider: str, model: str) -> str:
+    """Build a user-facing timeout message for the active LLM provider."""
     return (
         f"模型请求超时（provider={provider}, model={model}, "
         f"timeout={llm_http_timeout}s）。请检查本地模型/接口服务是否可用，"
@@ -61,6 +62,7 @@ def _llm_timeout_message(provider: str, model: str) -> str:
 
 
 def _stream_token_from_line(provider: str, raw_line: str) -> tuple[str, bool]:
+    """Parse one streamed provider line into token text and done state."""
     if provider == "openai-compatible":
         if not raw_line.startswith("data: "):
             return "", False
@@ -86,6 +88,7 @@ class Agent:
         settings: dict[str, Any] | None = None,
         mcp_client: Any = None,
     ) -> None:
+        """Initialize profile-scoped history, retrieval, provider, and MCP state."""
         # session_id is the local profile id. It is used as the history file
         # name and as the vector metadata filter for profile-owned knowledge.
         self.session_id = session_id
@@ -110,9 +113,11 @@ class Agent:
 
     @property
     def messages(self) -> list[dict[str, Any]]:
+        """Load the current profile's normalized chat messages on demand."""
         return self._read_messages()
 
     def _read_messages(self) -> list[dict[str, Any]]:
+        """Read persisted chat messages and discard malformed history entries."""
         if not self.file_path.exists():
             return []
 
@@ -133,6 +138,7 @@ class Agent:
         ]
 
     def _write_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Persist one profile's chat history to the runtime history file."""
         with self.file_path.open("w", encoding="utf-8") as handle:
             json.dump(messages, handle, ensure_ascii=False, indent=2)
 
@@ -151,6 +157,7 @@ class Agent:
         return _vector_store_cache[key]
 
     def _md5_file(self, profile_id: str = "shared") -> Path:
+        """Return the md5 marker file for shared or profile-owned knowledge."""
         if profile_id == "shared":
             return Path(md5_path)
         md5_dir = Path(md5_path).parent / "md5"
@@ -158,12 +165,14 @@ class Agent:
         return md5_dir / f"{profile_id}.txt"
 
     def _md5_files_for_check(self, profile_id: str = "shared") -> list[Path]:
+        """Return md5 files that should be checked for duplicate knowledge."""
         targets = [Path(md5_path)]
         if profile_id != "shared":
             targets.append(Path(md5_path).parent / "md5" / f"{profile_id}.txt")
         return targets
 
     def _hash_text(self, input_str: str, encoding: str = "utf-8") -> str:
+        """Hash knowledge content using the legacy md5 marker format."""
         return hashlib.md5(input_str.encode(encoding=encoding)).hexdigest()
 
     def check_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> bool:
@@ -178,11 +187,13 @@ class Agent:
         return True
 
     def update_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> None:
+        """Append a knowledge content hash to the target md5 marker file."""
         md5_hex = self._hash_text(input_str, encoding=encoding)
         with open(self._md5_file(profile_id), "a", encoding="utf-8") as handle:
             handle.write(f"{md5_hex}\n")
 
     def remove_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> bool:
+        """Remove a knowledge content hash from the profile md5 marker file."""
         target = self._md5_file(profile_id)
         if not target.exists():
             return False
@@ -199,6 +210,7 @@ class Agent:
         return removed
 
     def add_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
+        """Split, embed, and index one knowledge file for shared or profile scope."""
         if not self.check_md5(knowledge, profile_id=profile_id):
             return f"[Failed]The {filename} already exists"
 
@@ -222,12 +234,14 @@ class Agent:
         return f"[Success]Add {filename} into vector database"
 
     def remove_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
+        """Delete indexed chunks and md5 markers for one knowledge file."""
         vector_store = self._get_vector_store()
         vector_store.delete(where={"$and": [{"source": filename}, {"profile_id": profile_id}]})
         self.remove_md5(knowledge, profile_id=profile_id)
         return f"[Success]Remove {filename} from vector database"
 
     def _format_docs(self, docs: list[Document]) -> str:
+        """Render retrieved Chroma documents into compact prompt references."""
         if not docs:
             return ""
 
@@ -242,6 +256,7 @@ class Agent:
         return "\n\n".join(parts)
 
     def _retrieve(self, question: str, k: int, profile_id: str | None = None) -> str:
+        """Retrieve shared and profile-owned knowledge for a chat question."""
         # Lazily load user knowledge on first retrieval for this profile
         global _user_knowledge_loaded
         if profile_id and profile_id != "shared" and profile_id not in _user_knowledge_loaded:
@@ -268,6 +283,7 @@ class Agent:
         return await asyncio.to_thread(self._retrieve, question, k, profile_id)
 
     def _load_public_knowledge(self) -> None:
+        """Load bundled public knowledge into Chroma once per process."""
         global _public_knowledge_loaded
         if _public_knowledge_loaded:
             return
@@ -280,6 +296,7 @@ class Agent:
         self._load_knowledge_dir(public_dir, profile_id="shared")
 
     def _load_user_knowledge(self, profile_id: str) -> None:
+        """Load one profile's uploaded knowledge into Chroma if present."""
         user_dir = Path(user_knowledge_path) / profile_id
         if not user_dir.exists():
             return
@@ -287,6 +304,7 @@ class Agent:
         self._load_knowledge_dir(user_dir, profile_id=profile_id)
 
     def _load_knowledge_dir(self, directory: Path, profile_id: str) -> None:
+        """Index all JSON knowledge files from a directory for one scope."""
         for json_file in directory.glob("*.json"):
             try:
                 content = json_file.read_text(encoding="utf-8")
@@ -297,14 +315,22 @@ class Agent:
                 pass
 
     def _provider_config(self) -> dict[str, Any]:
+        """Resolve the active profile provider into a chat endpoint config."""
         provider = self.settings.get("ai", {}).get("provider", "ollama")
         if provider == "openai-compatible":
             settings = self.settings.get("ai", {}).get("openaiCompatible", {})
             api_key = (settings.get("apiKey") or "").strip()
-            base_url = (settings.get("baseUrl") or "").rstrip("/")
+            base_url = (settings.get("baseUrl") or "").strip().rstrip("/")
             chat_model = (settings.get("model") or "").strip()
             if not api_key or not base_url or not chat_model:
                 raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
+            logger.info(
+                "LLM provider selected: profile=%s provider=%s model=%s base=%s",
+                self.session_id,
+                provider,
+                chat_model,
+                urlparse(base_url).netloc or base_url,
+            )
             return {
                 "provider": provider,
                 "url": f"{base_url}/chat/completions",
@@ -313,10 +339,17 @@ class Agent:
             }
 
         settings = self.settings.get("ai", {}).get("ollama", {})
-        base_url = (settings.get("baseUrl") or ollama_base_url).rstrip("/")
-        chat_model = (settings.get("model") or model_name).strip() or model_name
+        base_url = (settings.get("baseUrl") or "").strip().rstrip("/")
+        chat_model = (settings.get("model") or "").strip()
         if not base_url or not chat_model:
             raise RuntimeError("Ollama 接口缺少 baseUrl 或 model。")
+        logger.info(
+            "LLM provider selected: profile=%s provider=%s model=%s base=%s",
+            self.session_id,
+            "ollama",
+            chat_model,
+            urlparse(base_url).netloc or base_url,
+        )
         return {
             "provider": "ollama",
             "url": f"{base_url}/api/chat",
@@ -325,6 +358,7 @@ class Agent:
         }
 
     def _content_to_text(self, content: Any) -> str:
+        """Flatten provider message content into plain text."""
         if isinstance(content, list):
             return "".join(
                 part.get("text", "") if isinstance(part, dict) else str(part)
@@ -333,6 +367,7 @@ class Agent:
         return str(content or "").strip()
 
     def _parse_tool_calls(self, raw_calls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """Normalize provider tool call payloads into MCP call descriptors."""
         tool_calls: list[dict[str, Any]] = []
         for raw_call in raw_calls or []:
             func = raw_call.get("function", {})
@@ -356,6 +391,7 @@ class Agent:
         stream: bool,
         tool_defs: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
+        """Build a provider-compatible chat payload for streaming or tool calls."""
         payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
         if tool_defs:
             payload["tools"] = tool_defs
@@ -366,6 +402,7 @@ class Agent:
         config: dict[str, Any],
         payload: dict[str, Any],
     ) -> AsyncIterator[str]:
+        """Yield streamed token text from the active provider endpoint."""
         try:
             async for line in async_fetch_stream_lines(
                 config["url"],
@@ -397,6 +434,7 @@ class Agent:
         tool_defs: list[dict[str, Any]] | None = None,
         stream: bool = False,
     ) -> dict[str, Any] | AsyncIterator[str]:
+        """Call the active provider once, optionally returning a token stream."""
         config = self._provider_config()
         payload = self._provider_payload(config["model"], messages, stream, tool_defs)
 
@@ -422,6 +460,7 @@ class Agent:
         }
 
     def _message_from_response(self, provider: str, response: dict[str, Any]) -> dict[str, Any]:
+        """Extract the assistant message object from provider-specific JSON."""
         if provider == "openai-compatible":
             choice = (response.get("choices") or [None])[0]
             if not choice:
@@ -459,12 +498,14 @@ class Agent:
         return tool_entries
 
     def _request_final_answer(self, messages: list[dict[str, Any]]) -> None:
+        """Append a prompt instruction that forbids further tool-call markup."""
         messages.append({
             "role": "user",
             "content": FINAL_ANSWER_ONLY_INSTRUCTION,
         })
 
     async def chat_stream(self, question: str, k: int = 3):
+        """Stream a full chat turn with optional RAG context and MCP tool calls."""
         context = await self._retrieve_async(question, k, profile_id=self.session_id)
         tool_defs = self._mcp_client.get_tool_definitions() if self._mcp_client else []
 
@@ -519,6 +560,7 @@ class Agent:
         timestamp: str,
         tool_history: list[dict[str, Any]],
     ) -> Iterator[dict[str, Any]]:
+        """Emit a safe fallback when a model prints tool markup as text."""
         fallback = tool_markup_fallback(tool_history)
         yield {"type": "token", "content": fallback}
         yield {"type": "done", "content": fallback}
@@ -531,6 +573,7 @@ class Agent:
         timestamp: str,
         tool_history: list[dict[str, Any]],
     ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the final answer while filtering provider tool-call markup."""
         full = ""
         prefix_buffer = ""
         prefix_released = False
@@ -573,6 +616,7 @@ class Agent:
         tool_calls: list[dict[str, Any]],
         tool_history: list[dict[str, Any]],
     ) -> AsyncIterator[dict[str, Any]]:
+        """Execute MCP tool calls and append tool results back into the prompt."""
         for tc in tool_calls:
             tool_name = tc.get("name", "")
             tool_args = tc.get("arguments", {})
@@ -599,6 +643,7 @@ class Agent:
         timestamp: str,
         tool_history: list[dict[str, Any]] | None = None,
     ) -> None:
+        """Persist the user turn, optional tool history, and assistant answer."""
         history = self.messages
         history.append({"role": "user", "content": question, "timestamp": timestamp})
         if tool_history:

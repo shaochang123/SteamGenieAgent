@@ -47,6 +47,25 @@
                 :placeholder="field.placeholder"
               >
             </label>
+
+            <div class="clear-actions">
+              <button
+                type="button"
+                class="clear-button"
+                :disabled="!canClearOllama"
+                @click="clearOllamaConfig"
+              >
+                清空 Ollama 配置
+              </button>
+              <button
+                type="button"
+                class="clear-button"
+                :disabled="!canClearOpenAI"
+                @click="clearOpenAIConfig"
+              >
+                清空 OpenAI 配置
+              </button>
+            </div>
           </section>
 
           <section class="section">
@@ -106,6 +125,33 @@ const STEAM_FIELDS = [
   { key: 'proxy', label: 'HTTP 代理 (Proxy)', type: 'text', placeholder: 'http://127.0.0.1:7890', hint: '用于访问 Steam API 的代理地址，留空则不使用代理' },
 ]
 
+const AI_DEFAULTS = {
+  provider: 'ollama',
+  ollama: {
+    baseUrl: 'http://127.0.0.1:11434',
+    model: 'qwen3:8b',
+  },
+  openaiCompatible: {
+    apiKey: '',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4.1-mini',
+  },
+}
+
+const STEAM_DEFAULTS = {
+  apiKey: '',
+  steamId: '',
+  steamPath: '',
+  country: 'CN',
+  language: 'zh-CN',
+  proxy: '',
+}
+
+function textOrDefault(value, fallback) {
+  const nextValue = value === undefined || value === null ? fallback : value
+  return typeof nextValue === 'string' ? nextValue : String(nextValue)
+}
+
 function normalizeProfile(profile) {
   if (!profile) {
     return null
@@ -113,24 +159,24 @@ function normalizeProfile(profile) {
 
   return {
     ai: {
-      provider: profile.ai?.provider || 'ollama',
+      provider: textOrDefault(profile.ai?.provider, AI_DEFAULTS.provider),
       ollama: {
-        baseUrl: profile.ai?.ollama?.baseUrl || 'http://127.0.0.1:11434',
-        model: profile.ai?.ollama?.model || 'qwen3:8b',
+        baseUrl: textOrDefault(profile.ai?.ollama?.baseUrl, AI_DEFAULTS.ollama.baseUrl),
+        model: textOrDefault(profile.ai?.ollama?.model, AI_DEFAULTS.ollama.model),
       },
       openaiCompatible: {
-        apiKey: profile.ai?.openaiCompatible?.apiKey || '',
-        baseUrl: profile.ai?.openaiCompatible?.baseUrl || 'https://api.openai.com/v1',
-        model: profile.ai?.openaiCompatible?.model || 'gpt-4.1-mini',
+        apiKey: textOrDefault(profile.ai?.openaiCompatible?.apiKey, AI_DEFAULTS.openaiCompatible.apiKey),
+        baseUrl: textOrDefault(profile.ai?.openaiCompatible?.baseUrl, AI_DEFAULTS.openaiCompatible.baseUrl),
+        model: textOrDefault(profile.ai?.openaiCompatible?.model, AI_DEFAULTS.openaiCompatible.model),
       },
     },
     steam: {
-      apiKey: profile.steam?.apiKey || '',
-      steamId: profile.steam?.steamId || '',
-      steamPath: profile.steam?.steamPath || '',
-      country: profile.steam?.country || 'CN',
-      language: profile.steam?.language || 'zh-CN',
-      proxy: profile.steam?.proxy || '',
+      apiKey: textOrDefault(profile.steam?.apiKey, STEAM_DEFAULTS.apiKey),
+      steamId: textOrDefault(profile.steam?.steamId, STEAM_DEFAULTS.steamId),
+      steamPath: textOrDefault(profile.steam?.steamPath, STEAM_DEFAULTS.steamPath),
+      country: textOrDefault(profile.steam?.country, STEAM_DEFAULTS.country),
+      language: textOrDefault(profile.steam?.language, STEAM_DEFAULTS.language),
+      proxy: textOrDefault(profile.steam?.proxy, STEAM_DEFAULTS.proxy),
     },
   }
 }
@@ -184,10 +230,24 @@ export default {
     steamFields() {
       return STEAM_FIELDS
     },
+    canClearOllama() {
+      return this.draft && this.draft.ai.provider !== 'ollama'
+    },
+    canClearOpenAI() {
+      return this.draft && this.draft.ai.provider !== 'openai-compatible'
+    },
   },
   methods: {
     resetDraft() {
       this.draft = normalizeProfile(this.profile)
+    },
+    clearOllamaConfig() {
+      if (!this.canClearOllama) return
+      this.draft.ai.ollama = { baseUrl: '', model: '' }
+    },
+    clearOpenAIConfig() {
+      if (!this.canClearOpenAI) return
+      this.draft.ai.openaiCompatible = { apiKey: '', baseUrl: '', model: '' }
     },
     submit() {
       if (!this.draft) {
@@ -342,6 +402,28 @@ h2 {
   color: #8a99ae;
   font-size: 12px;
   margin-top: -2px;
+}
+
+.clear-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.clear-button {
+  border: 0;
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: rgba(255, 232, 232, 0.86);
+  color: #b33b3b;
+  cursor: pointer;
+}
+
+.clear-button:disabled {
+  color: #9aa7b8;
+  background: rgba(235, 241, 251, 0.78);
+  cursor: not-allowed;
 }
 
 .sheet__footer {

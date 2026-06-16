@@ -65,88 +65,80 @@ function scanScreenshotFiles(userdataPath: string, appid?: number): ScreenshotFi
 export function registerLocalTools(server: McpServer, steamPath: string) {
   server.tool(
     "list_installed_games",
-    "扫描本地 Steam 文件夹，列出所有已安装的游戏。无需 API Key，直接读取本地 VDF 文件。",
+    "Scan local Steam library folders and list installed games without requiring a Steam API key.",
     {
       library_path: z
         .string()
         .optional()
-        .describe("指定 Steam 库路径，不填则自动检测"),
+        .describe("Optional Steam library path. If omitted, the configured or detected Steam path is used."),
     },
     async ({ library_path }) => {
       const sp = library_path || steamPath;
       const games = scanInstalledGames(sp);
 
       if (games.length === 0) {
-        return textResult(`未找到已安装的游戏。检测路径：${sp}\n\n尝试手动指定 library_path 或检查 Steam 是否安装。`);
+        return textResult(`No installed games were found. Detected path: ${sp}\n\nPass library_path manually or verify that Steam is installed.`);
       }
 
       const totalSize = games.reduce((sum, g) => sum + g.sizeOnDisk, 0);
       const totalSizeGB = formatGigabytes(totalSize);
 
       const lines = games
-        .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+        .sort((a, b) => a.name.localeCompare(b.name))
         .map((g) => {
           const gameSizeGB = formatGigabytes(g.sizeOnDisk);
           const updated = g.lastUpdated
-            ? new Date(g.lastUpdated * 1000).toLocaleDateString("zh-CN")
-            : "未知";
+            ? new Date(g.lastUpdated * 1000).toLocaleDateString("en-US")
+            : "Unknown";
           return `- **${g.name}** (AppID: ${g.appid})
-  📀 ${gameSizeGB} GB | 最后更新: ${updated} | 库: ${path.basename(g.libraryPath)}`;
+  Size: ${gameSizeGB} GB | Last updated: ${updated} | Library: ${path.basename(g.libraryPath)}`;
         });
 
-      return textResult(`💿 **已安装游戏** (${games.length} 款，共 ${totalSizeGB} GB)
-
-${lines.join("\n")}
-
-💡 使用 launch_game 启动游戏。`);
+      return textResult(`Installed games (${games.length}, total ${totalSizeGB} GB)\n\n${lines.join("\n")}\n\nUse launch_game to start a game.`);
     }
   );
 
   server.tool(
     "list_library_folders",
-    "列出所有 Steam 游戏库文件夹的位置及占用情况。",
+    "List local Steam library folders with game counts and disk usage.",
     {},
     async () => {
       const folders = getLibraryFolders(steamPath);
 
       if (folders.length === 0) {
-        return textResult("未找到 Steam 库文件夹。请检查 Steam 是否正确安装。");
+        return textResult("No Steam library folders were found. Verify that Steam is installed correctly.");
       }
 
       const lines = folders.map((f) => {
         const folderSizeGB = formatGigabytes(f.totalsize);
-        return `- **${f.label || "默认库"}** (${f.apps.length} 款游戏)
-  📁 ${f.path}
-  📀 占用: ${folderSizeGB} GB`;
+        return `- **${f.label || "Default library"}** (${f.apps.length} games)
+  Path: ${f.path}
+  Disk usage: ${folderSizeGB} GB`;
       });
 
-      return textResult(`📁 **Steam 库文件夹** (${folders.length} 个)
-
-${lines.join("\n")}
-
-总游戏数: ${folders.reduce((s, f) => s + f.apps.length, 0)}`);
+      return textResult(`Steam library folders (${folders.length})\n\n${lines.join("\n")}\n\nTotal games: ${folders.reduce((s, f) => s + f.apps.length, 0)}`);
     }
   );
 
   server.tool(
     "get_screenshots",
-    "列出本地 Steam 截图文件夹中的截图。",
+    "List local Steam screenshots from the configured Steam userdata folder.",
     {
       appid: z
         .number()
         .optional()
-        .describe("按游戏 AppID 筛选，不填则列出所有"),
+        .describe("Optional Steam AppID filter. If omitted, screenshots for all games are returned."),
       limit: z
         .number()
         .optional()
         .default(20)
-        .describe("返回数量上限"),
+        .describe("Maximum number of screenshots to return."),
     },
     async ({ appid, limit }) => {
       const screenshotsPath = path.join(steamPath, "userdata");
 
       if (!fs.existsSync(screenshotsPath)) {
-        return textResult("未找到截图文件夹。请确认 Steam 已安装并至少截过一次图。");
+        return textResult("Steam screenshot folder was not found. Verify that Steam is installed and that screenshots exist.");
       }
 
       const screenshots = scanScreenshotFiles(screenshotsPath, appid);
@@ -156,50 +148,46 @@ ${lines.join("\n")}
         .slice(0, limit);
 
       if (filtered.length === 0) {
-        return textResult(appid ? `未找到 AppID ${appid} 的截图。` : "未找到任何截图。");
+        return textResult(appid ? `No screenshots found for AppID ${appid}.` : "No screenshots found.");
       }
 
       const lines = filtered.map((s) => {
         const sizeKB = (s.size / 1024).toFixed(0);
-        return `- 🖼️ ${s.fileName} (AppID: ${s.appid})
-  📅 ${s.created.toLocaleDateString("zh-CN")} | ${sizeKB} KB
-  📁 ${s.fullPath}`;
+        return `- ${s.fileName} (AppID: ${s.appid})
+  Date: ${s.created.toLocaleDateString("en-US")} | ${sizeKB} KB
+  Path: ${s.fullPath}`;
       });
 
-      return textResult(`📸 **Steam 截图** (${filtered.length} 张)
-
-${lines.join("\n")}`);
+      return textResult(`Steam screenshots (${filtered.length})\n\n${lines.join("\n")}`);
     }
   );
 
   server.tool(
     "list_shortcuts",
-    "列出本地 Steam 添加的非 Steam 快捷方式游戏。",
+    "List local non-Steam shortcuts added to Steam.",
     {
       steam_id: z
         .string()
         .optional()
-        .describe("SteamID64（需提供才能找到对应 shortcuts.vdf）"),
+        .describe("SteamID64. Required to locate the user's shortcuts.vdf file."),
     },
     async ({ steam_id }) => {
       if (!steam_id) {
-        return textResult("需要提供 steam_id 才能读取快捷方式。");
+        return textResult("steam_id is required to read non-Steam shortcuts.");
       }
 
       const shortcuts = readShortcuts(steamPath, steam_id);
 
       if (shortcuts.length === 0) {
-        return textResult("未找到非 Steam 快捷方式。");
+        return textResult("No non-Steam shortcuts were found.");
       }
 
       const lines = shortcuts.map(
         (s) =>
-          `- **${s.name}** (虚拟 AppID: ${s.appid})\n  📁 ${s.exe}`
+          `- **${s.name}** (virtual AppID: ${s.appid})\n  Executable: ${s.exe}`
       );
 
-      return textResult(`🔗 **非 Steam 快捷方式** (${shortcuts.length} 个)
-
-${lines.join("\n")}`);
+      return textResult(`Non-Steam shortcuts (${shortcuts.length})\n\n${lines.join("\n")}`);
     }
   );
 }

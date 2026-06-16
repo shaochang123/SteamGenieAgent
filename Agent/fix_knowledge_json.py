@@ -62,6 +62,7 @@ def fix_json_string(text: str) -> str:
 
 
 def fix_json_file(filepath: str) -> bool:
+    """Repair one JSON file in place and report whether it changed."""
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
 
@@ -85,6 +86,7 @@ def fix_json_file(filepath: str) -> bool:
 
 
 def main():
+    """Scan bundled knowledge JSON files and repair invalid string escaping."""
     knowledge_dir = Path(__file__).parent / 'Knowledge'
     if not knowledge_dir.is_dir():
         print(f"Knowledge directory not found: {knowledge_dir}")
