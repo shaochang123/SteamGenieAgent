@@ -214,24 +214,24 @@ export function registerLibraryTools(
 
   server.tool(
     "launch_game",
-    "Launch a Steam game by AppID. The game must be owned by the configured Steam account.",
+    "Launch a locally installed Steam game by AppID. This only checks local Steam manifests and ignores the configured Steam account.",
     {
-      appid: z.number().describe("Steam AppID for an owned game."),
+      appid: z.number().describe("Steam AppID for a locally installed game."),
     },
     async ({ appid }) => {
-      const games = await api.getOwnedGames();
-      const owned = games.find((g) => g.appid === appid);
-      if (!owned) {
-        const ownedIds = games.map((g) => g.appid).join(", ");
+      const installedGames = scanInstalledGames(steamPath);
+      const installed = installedGames.find((g) => g.appid === appid);
+      if (!installed) {
+        const installedIds = installedGames.map((g) => g.appid).join(", ");
         return textResult(
-          `The configured account does not own AppID ${appid}, so it cannot be launched.\n\nOwned AppIDs: ${ownedIds.substring(0, 500)}`
+          `AppID ${appid} was not found in the local Steam installation, so it cannot be launched automatically.\n\nInstalled AppIDs: ${installedIds.substring(0, 500) || "none"}\n\nDetected Steam path: ${steamPath}`
         );
       }
 
       const result = await launchGame(appid, steamPath);
       return textResult(
         result.success
-          ? `${result.message}\nAttempted to launch **${owned.name}** (AppID: ${appid}).`
+          ? `${result.message}\nAttempted to launch **${installed.name}** (AppID: ${appid}) from local Steam library at ${installed.libraryPath}.`
           : result.message
       );
     }

@@ -712,8 +712,27 @@ a {
 }
 
 .device-tablet .steam-drawer-toggle {
-  right: 18px;
-  bottom: calc(18px + env(safe-area-inset-bottom));
+  top: 50%;
+  right: 0;
+  bottom: auto;
+  width: 44px;
+  min-height: 96px;
+  place-items: center;
+  border-radius: 18px 0 0 18px;
+  padding: 10px 8px;
+  text-align: center;
+  transform: translateY(-50%);
+}
+
+.device-tablet .steam-drawer-toggle span,
+.device-mobile .steam-drawer-toggle span {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.08em;
+}
+
+.device-tablet .steam-drawer-toggle strong,
+.device-mobile .steam-drawer-toggle strong {
+  display: none;
 }
 
 .device-tablet .steam-drawer {
@@ -778,10 +797,16 @@ a {
 }
 
 .device-mobile .steam-drawer-toggle {
-  right: 12px;
-  bottom: calc(12px + env(safe-area-inset-bottom));
-  border-radius: 18px;
-  padding: 10px 14px;
+  top: 50%;
+  right: 0;
+  bottom: auto;
+  width: 40px;
+  min-height: 88px;
+  place-items: center;
+  border-radius: 16px 0 0 16px;
+  padding: 9px 7px;
+  text-align: center;
+  transform: translateY(-50%);
 }
 
 .device-mobile .steam-drawer {
