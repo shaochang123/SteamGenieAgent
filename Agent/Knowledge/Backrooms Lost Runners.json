@@ -1,0 +1,26 @@
+{
+  "name": "Backrooms Lost Runners",
+  "appid": 3072120,
+  "release_date": "17 Jun, 2026",
+  "developer": "ShimStudioGames",
+  "publisher": "ShimStudioGames",
+  "source": "Steam store page checked on 2026-06-17",
+  "source_urls": [
+    "https://store.steampowered.com/app/3072120/Backrooms_Lost_Runners/",
+    "https://steamdb.info/app/3072120/"
+  ],
+  "description": "Backrooms Lost Runners is a co-op survival horror game with team play, voice-reactive AI, and immersive puzzles. Players explore liminal spaces, avoid entities, and must be careful because sound can give them away.",
+  "tags": [
+    "Story Rich",
+    "PvE",
+    "Survival Horror",
+    "Adventure",
+    "Co-op",
+    "Psychological Horror"
+  ],
+  "rag_test_fact": "RAG_PROBE_STEAM_20260617_BACKROOMS_BLUE_LANTERN",
+  "rag_test_instruction": "If the user asks whether RAG found this new Steam game knowledge, answer with the exact probe string RAG_PROBE_STEAM_20260617_BACKROOMS_BLUE_LANTERN and mention that the game released on Steam on 17 Jun, 2026.",
+  "comment1": "This file is intentionally added as a recent-Steam-release RAG validation sample. The unique probe string should not be known from model pretraining.",
+  "comment2": "A good validation question is: What is the RAG probe string for Backrooms Lost Runners?",
+  "comment3": "Expected answer must include the exact probe string and the release date."
+}

@@ -16,8 +16,13 @@ const PERSONA_STATE: Record<number, string> = {
 };
 
 const COOP_CATEGORY_IDS = [1, 9, 24, 27, 29, 38, 49]; // Multi-player, Co-op, Online Co-op, etc.
+const STEAM_ID64_RE = /^\d{17}$/;
 const isOnline = (friend: SteamFriend): boolean => friend.personastate !== 0;
 const isPlaying = (friend: SteamFriend): boolean => Boolean(friend.gameextrainfo);
+
+type FriendResolution =
+  | { ok: true; steamId: string; label: string }
+  | { ok: false; error: string };
 
 function compareFriends(a: SteamFriend, b: SteamFriend): number {
   if (isOnline(a) && !isOnline(b)) return -1;
@@ -30,7 +35,74 @@ function compareFriends(a: SteamFriend, b: SteamFriend): number {
 function formatFriendLine(friend: SteamFriend): string {
   const status = PERSONA_STATE[friend.personastate || 0] || "Unknown";
   const playing = friend.gameextrainfo ? ` | playing ${friend.gameextrainfo}` : "";
-  return `- **${friend.personaname || friend.steamid}** - ${status}${playing}`;
+  const displayName = friend.personaname || "Unknown";
+  return `- **${displayName}** (SteamID64: ${friend.steamid}) - ${status}${playing}`;
+}
+
+function friendLabel(friend: SteamFriend): string {
+  return `${friend.personaname || "Unknown"} (${friend.steamid})`;
+}
+
+function friendlySteamError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("400")) {
+    return "Steam rejected the request. This usually means the friend identifier is not a valid SteamID64, or Steam cannot expose that account's library through the Web API.";
+  }
+  return message;
+}
+
+async function resolveFriendSteamId(
+  api: SteamApiClient,
+  friendQuery: string
+): Promise<FriendResolution> {
+  const query = String(friendQuery || "").trim();
+  if (!query) {
+    return {
+      ok: false,
+      error: "friend_steam_id is required. Provide a SteamID64, or call get_friend_list first and use a returned friend SteamID64.",
+    };
+  }
+
+  if (STEAM_ID64_RE.test(query)) {
+    return { ok: true, steamId: query, label: query };
+  }
+
+  let friends: SteamFriend[] = [];
+  try {
+    friends = await api.getEnrichedFriends();
+  } catch {
+    friends = [];
+  }
+
+  const normalized = query.toLowerCase();
+  const exact = friends.find((friend) =>
+    friend.steamid === query ||
+    (friend.personaname || "").toLowerCase() === normalized
+  );
+  if (exact) {
+    return { ok: true, steamId: exact.steamid, label: friendLabel(exact) };
+  }
+
+  const partialMatches = friends
+    .filter((friend) => (friend.personaname || "").toLowerCase().includes(normalized))
+    .slice(0, 5);
+
+  if (partialMatches.length === 1) {
+    const friend = partialMatches[0];
+    return { ok: true, steamId: friend.steamid, label: friendLabel(friend) };
+  }
+
+  if (partialMatches.length > 1) {
+    return {
+      ok: false,
+      error: `Multiple friends matched "${query}". Use one exact SteamID64 instead: ${partialMatches.map(friendLabel).join(", ")}`,
+    };
+  }
+
+  return {
+    ok: false,
+    error: `Could not resolve "${query}" to a friend SteamID64. Call get_friend_list first, then pass the friend's SteamID64 to find_shared_games.`,
+  };
 }
 
 export function registerSocialTools(
@@ -78,7 +150,7 @@ Use find_shared_games to inspect games shared with a specific friend.`);
     {
       friend_steam_id: z
         .string()
-        .describe("Friend SteamID64."),
+        .describe("Friend SteamID64. An exact Steam persona name is accepted only if it can be resolved from get_friend_list."),
       coop_only: z
         .boolean()
         .optional()
@@ -91,17 +163,34 @@ Use find_shared_games to inspect games shared with a specific friend.`);
         .describe("Maximum number of shared games to return."),
     },
     async ({ friend_steam_id, limit }) => {
-      const myGames = await api.getOwnedGames();
+      let myGames;
+      try {
+        myGames = await api.getOwnedGames();
+      } catch (error) {
+        return textResult(`Unable to read the configured user's game library. ${friendlySteamError(error)}`);
+      }
       if (myGames.length === 0) {
         return textResult("Unable to read the configured user's game library. Configure Steam API access first.");
       }
 
-      const friendApi = new SteamApiClient(api.apiKey, friend_steam_id);
-      const friendGames = await friendApi.getOwnedGames();
+      const resolvedFriend = await resolveFriendSteamId(api, friend_steam_id);
+      if (!resolvedFriend.ok) {
+        return textResult(resolvedFriend.error);
+      }
+
+      const friendApi = new SteamApiClient(api.apiKey, resolvedFriend.steamId);
+      let friendGames;
+      try {
+        friendGames = await friendApi.getOwnedGames();
+      } catch (error) {
+        return textResult(
+          `Unable to read the game library for friend ${resolvedFriend.label}. ${friendlySteamError(error)}`
+        );
+      }
 
       if (friendGames.length === 0) {
         return textResult(
-          `Unable to read the game library for friend ${friend_steam_id}. Verify that the friend's Steam library is public.`
+          `Unable to read the game library for friend ${resolvedFriend.label}. Verify that the friend's Steam library is public.`
         );
       }
 

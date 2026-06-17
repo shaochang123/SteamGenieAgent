@@ -329,6 +329,7 @@ async def get_steam_deals(profile_id: str) -> dict[str, Any]:
 async def get_knowledge(profile_id: str) -> dict[str, Any]:
     """Return public and profile-owned knowledge file metadata."""
     resolve_profile(profile_id)
+    build_agent(profile_id).sync_knowledge_files(profile_id)
     return store.list_knowledge_files(profile_id)
 
 
@@ -364,6 +365,7 @@ async def upload_knowledge(profile_id: str, file: UploadFile):
     filename, content, knowledge_text = await read_knowledge_upload(file)
 
     agent = build_agent(profile_id)
+    agent.sync_knowledge_files(profile_id)
     if not agent.check_md5(knowledge_text, profile_id=profile_id):
         raise HTTPException(status_code=409, detail="知识库内容已存在。")
 

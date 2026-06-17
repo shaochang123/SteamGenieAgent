@@ -42,9 +42,10 @@ logger = logging.getLogger("Agent")
 # module scope so each profile request can share the same underlying objects.
 _public_knowledge_loaded = False
 _user_knowledge_loaded: set[str] = set()
+_knowledge_sync_signatures: dict[str, tuple[tuple[str, int, int], ...]] = {}
 _embedding_model: OllamaEmbeddings | None = None
 _vector_store_cache: dict[str, Chroma] = {}
-MAX_TOOL_TURNS = 5
+MAX_TOOL_TURNS = 50
 
 
 def utc_now() -> str:
@@ -156,6 +157,133 @@ class Agent:
             )
         return _vector_store_cache[key]
 
+    def _knowledge_dir_for_profile(self, profile_id: str = "shared") -> Path:
+        """Return the filesystem directory for shared or profile-owned knowledge."""
+        if profile_id == "shared":
+            return Path(knowledge_path)
+        return Path(user_knowledge_path) / profile_id
+
+    def _knowledge_dir_signature(self, directory: Path) -> tuple[tuple[str, int, int], ...]:
+        """Return a cheap change signature for JSON files in a knowledge directory."""
+        if not directory.exists():
+            return ()
+        entries: list[tuple[str, int, int]] = []
+        for json_file in sorted(directory.glob("*.json")):
+            try:
+                stat = json_file.stat()
+            except FileNotFoundError:
+                continue
+            entries.append((json_file.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(entries)
+
+    def _read_md5_hashes(self, profile_id: str = "shared") -> set[str]:
+        """Read existing md5 marker hashes for one knowledge scope."""
+        target = self._md5_file(profile_id)
+        if not target.exists():
+            return set()
+        return {
+            line.strip()
+            for line in target.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+    def _write_md5_hashes(self, profile_id: str, hashes: set[str]) -> None:
+        """Rewrite one md5 marker file, removing it when no hashes remain."""
+        target = self._md5_file(profile_id)
+        if not hashes:
+            target.unlink(missing_ok=True)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(sorted(hashes)) + "\n", encoding="utf-8")
+
+    def _knowledge_hashes_by_source(self, directory: Path) -> dict[str, str]:
+        """Hash all readable JSON knowledge files by their basename."""
+        hashes: dict[str, str] = {}
+        if not directory.exists():
+            return hashes
+        for json_file in sorted(directory.glob("*.json")):
+            try:
+                hashes[json_file.name] = self._hash_text(json_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("Unable to hash knowledge file %s: %s", json_file, exc)
+        return hashes
+
+    def _vector_sources_for_profile(self, profile_id: str) -> set[str] | None:
+        """Return source filenames currently indexed in Chroma for one scope."""
+        try:
+            payload = self._get_vector_store().get(
+                where={"profile_id": profile_id},
+                include=["metadatas"],
+            )
+        except Exception as exc:
+            logger.warning("Unable to inspect vector metadata for %s: %s", profile_id, exc)
+            return None
+
+        sources: set[str] = set()
+        for metadata in payload.get("metadatas") or []:
+            if isinstance(metadata, dict) and metadata.get("source"):
+                sources.add(str(metadata["source"]))
+        return sources
+
+    def _delete_vector_source(self, source: str, profile_id: str) -> None:
+        """Delete all Chroma chunks for one source file and knowledge scope."""
+        self._get_vector_store().delete(
+            where={"$and": [{"source": source}, {"profile_id": profile_id}]}
+        )
+
+    def _sync_knowledge_dir(self, directory: Path, profile_id: str) -> bool:
+        """Synchronize md5 markers and vectors with files currently on disk."""
+        global _knowledge_sync_signatures
+        sync_key = f"{profile_id}:{directory.resolve()}"
+        signature = self._knowledge_dir_signature(directory)
+        if _knowledge_sync_signatures.get(sync_key) == signature:
+            return False
+
+        current_hashes = self._knowledge_hashes_by_source(directory)
+        current_sources = set(current_hashes)
+        vector_sources = self._vector_sources_for_profile(profile_id)
+
+        if vector_sources is not None:
+            for stale_source in sorted(vector_sources - current_sources):
+                try:
+                    self._delete_vector_source(stale_source, profile_id)
+                    logger.info(
+                        "Removed stale vector entries for %s in profile %s",
+                        stale_source,
+                        profile_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Unable to remove stale vector entries for %s/%s: %s",
+                        profile_id,
+                        stale_source,
+                        exc,
+                    )
+
+            indexed_hashes = {
+                current_hashes[source]
+                for source in vector_sources & current_sources
+            }
+        else:
+            indexed_hashes = set(current_hashes.values())
+
+        existing_hashes = self._read_md5_hashes(profile_id)
+        self._write_md5_hashes(profile_id, existing_hashes & indexed_hashes)
+        _knowledge_sync_signatures[sync_key] = signature
+        return True
+
+    def _refresh_knowledge_dir(self, directory: Path, profile_id: str) -> None:
+        """Synchronize a knowledge directory and index newly added files."""
+        changed = self._sync_knowledge_dir(directory, profile_id)
+        if changed:
+            self._load_knowledge_dir(directory, profile_id=profile_id)
+
+    def sync_knowledge_files(self, profile_id: str | None = None) -> None:
+        """Synchronize shared and profile-owned knowledge sidecars with files."""
+        self._refresh_knowledge_dir(self._knowledge_dir_for_profile("shared"), "shared")
+        if profile_id and profile_id != "shared":
+            self._refresh_knowledge_dir(self._knowledge_dir_for_profile(profile_id), profile_id)
+
     def _md5_file(self, profile_id: str = "shared") -> Path:
         """Return the md5 marker file for shared or profile-owned knowledge."""
         if profile_id == "shared":
@@ -257,6 +385,8 @@ class Agent:
 
     def _retrieve(self, question: str, k: int, profile_id: str | None = None) -> str:
         """Retrieve shared and profile-owned knowledge for a chat question."""
+        self.sync_knowledge_files(profile_id)
+
         # Lazily load user knowledge on first retrieval for this profile
         global _user_knowledge_loaded
         if profile_id and profile_id != "shared" and profile_id not in _user_knowledge_loaded:
@@ -293,7 +423,7 @@ class Agent:
         if not public_dir.exists():
             return
 
-        self._load_knowledge_dir(public_dir, profile_id="shared")
+        self._refresh_knowledge_dir(public_dir, profile_id="shared")
 
     def _load_user_knowledge(self, profile_id: str) -> None:
         """Load one profile's uploaded knowledge into Chroma if present."""
@@ -301,7 +431,7 @@ class Agent:
         if not user_dir.exists():
             return
 
-        self._load_knowledge_dir(user_dir, profile_id=profile_id)
+        self._refresh_knowledge_dir(user_dir, profile_id=profile_id)
 
     def _load_knowledge_dir(self, directory: Path, profile_id: str) -> None:
         """Index all JSON knowledge files from a directory for one scope."""
