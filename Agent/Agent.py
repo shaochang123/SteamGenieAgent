@@ -5,8 +5,10 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Iterator
+from urllib.parse import urlparse
 
+import httpx
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
@@ -18,24 +20,64 @@ from config import (
     embedding_model_name,
     history_path,
     knowledge_path,
+    llm_http_timeout,
     max_split_char_number,
     md5_path,
-    model_name,
-    ollama_base_url,
     separators,
-    system_prompt,
-    system_prompt_with_tools,
     user_knowledge_path,
     vector_path,
 )
+from context_builder import build_prompt_messages
 from http_utils import async_fetch_json, async_fetch_stream_lines
+from tool_markup import (
+    FINAL_ANSWER_ONLY_INSTRUCTION,
+    looks_like_tool_markup,
+    should_buffer_tool_markup,
+    tool_markup_fallback,
+)
 
 logger = logging.getLogger("Agent")
 
+# Embedding models and Chroma handles are expensive to build. Keep them at
+# module scope so each profile request can share the same underlying objects.
 _public_knowledge_loaded = False
 _user_knowledge_loaded: set[str] = set()
+_knowledge_sync_signatures: dict[str, tuple[tuple[str, int, int], ...]] = {}
 _embedding_model: OllamaEmbeddings | None = None
 _vector_store_cache: dict[str, Chroma] = {}
+MAX_TOOL_TURNS = 50
+
+
+def utc_now() -> str:
+    """Return an ISO timestamp for chat and knowledge metadata."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _llm_timeout_message(provider: str, model: str) -> str:
+    """Build a user-facing timeout message for the active LLM provider."""
+    return (
+        f"模型请求超时（provider={provider}, model={model}, "
+        f"timeout={llm_http_timeout}s）。请检查本地模型/接口服务是否可用，"
+        "或减少上下文、降低知识库召回数量 k、调大 Agent/config.py 的 llm_http_timeout。"
+    )
+
+
+def _stream_token_from_line(provider: str, raw_line: str) -> tuple[str, bool]:
+    """Parse one streamed provider line into token text and done state."""
+    if provider == "openai-compatible":
+        if not raw_line.startswith("data: "):
+            return "", False
+        data_str = raw_line[6:]
+        if data_str == "[DONE]":
+            return "", True
+        chunk = json.loads(data_str)
+        choices = chunk.get("choices") or []
+        if not choices:
+            return "", False
+        return choices[0].get("delta", {}).get("content", ""), False
+
+    chunk = json.loads(raw_line)
+    return chunk.get("message", {}).get("content", ""), bool(chunk.get("done", False))
 
 
 class Agent:
@@ -47,13 +89,16 @@ class Agent:
         settings: dict[str, Any] | None = None,
         mcp_client: Any = None,
     ) -> None:
+        """Initialize profile-scoped history, retrieval, provider, and MCP state."""
+        # session_id is the local profile id. It is used as the history file
+        # name and as the vector metadata filter for profile-owned knowledge.
         self.session_id = session_id
         self.storage_path = Path(storage_path)
         self.vector_root = Path(vector_root)
         self.settings = settings or {}
         self._mcp_client = mcp_client
         self.file_path = self.storage_path / f"{self.session_id}.json"
-        self.spliter = RecursiveCharacterTextSplitter(
+        self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             separators=separators,
@@ -69,56 +114,37 @@ class Agent:
 
     @property
     def messages(self) -> list[dict[str, Any]]:
+        """Load the current profile's normalized chat messages on demand."""
         return self._read_messages()
 
     def _read_messages(self) -> list[dict[str, Any]]:
+        """Read persisted chat messages and discard malformed history entries."""
         if not self.file_path.exists():
             return []
 
         with self.file_path.open("r", encoding="utf-8") as handle:
             raw_messages = json.load(handle)
 
-        normalized: list[dict[str, Any]] = []
         if not isinstance(raw_messages, list):
-            return normalized
+            return []
 
-        for item in raw_messages:
-            if isinstance(item, dict) and "role" in item and "content" in item:
-                normalized.append(
-                    {
-                        "role": item["role"],
-                        "content": item["content"],
-                        "timestamp": item.get("timestamp"),
-                    }
-                )
-                continue
-
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("type")
-            payload = item.get("data", {})
-            content = payload.get("content", "")
-            if role == "human":
-                normalized.append(
-                    {"role": "user", "content": content, "timestamp": item.get("timestamp")}
-                )
-            elif role in {"ai", "assistant"}:
-                normalized.append(
-                    {
-                        "role": "assistant",
-                        "content": content,
-                        "timestamp": item.get("timestamp"),
-                    }
-                )
-
-        return normalized
+        return [
+            {
+                "role": item["role"],
+                "content": item["content"],
+                "timestamp": item.get("timestamp"),
+            }
+            for item in raw_messages
+            if isinstance(item, dict) and "role" in item and "content" in item
+        ]
 
     def _write_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Persist one profile's chat history to the runtime history file."""
         with self.file_path.open("w", encoding="utf-8") as handle:
             json.dump(messages, handle, ensure_ascii=False, indent=2)
 
     def _get_vector_store(self) -> Chroma:
+        """Return a cached Chroma store for the configured runtime vector path."""
         global _embedding_model, _vector_store_cache
         if _embedding_model is None:
             _embedding_model = OllamaEmbeddings(model=embedding_model_name)
@@ -131,34 +157,193 @@ class Agent:
             )
         return _vector_store_cache[key]
 
+    def _knowledge_dir_for_profile(self, profile_id: str = "shared") -> Path:
+        """Return the filesystem directory for shared or profile-owned knowledge."""
+        if profile_id == "shared":
+            return Path(knowledge_path)
+        return Path(user_knowledge_path) / profile_id
+
+    def _knowledge_dir_signature(self, directory: Path) -> tuple[tuple[str, int, int], ...]:
+        """Return a cheap change signature for JSON files in a knowledge directory."""
+        if not directory.exists():
+            return ()
+        entries: list[tuple[str, int, int]] = []
+        for json_file in sorted(directory.glob("*.json")):
+            try:
+                stat = json_file.stat()
+            except FileNotFoundError:
+                continue
+            entries.append((json_file.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(entries)
+
+    def _read_md5_hashes(self, profile_id: str = "shared") -> set[str]:
+        """Read existing md5 marker hashes for one knowledge scope."""
+        target = self._md5_file(profile_id)
+        if not target.exists():
+            return set()
+        return {
+            line.strip()
+            for line in target.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+    def _write_md5_hashes(self, profile_id: str, hashes: set[str]) -> None:
+        """Rewrite one md5 marker file, removing it when no hashes remain."""
+        target = self._md5_file(profile_id)
+        if not hashes:
+            target.unlink(missing_ok=True)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(sorted(hashes)) + "\n", encoding="utf-8")
+
+    def _knowledge_hashes_by_source(self, directory: Path) -> dict[str, str]:
+        """Hash all readable JSON knowledge files by their basename."""
+        hashes: dict[str, str] = {}
+        if not directory.exists():
+            return hashes
+        for json_file in sorted(directory.glob("*.json")):
+            try:
+                hashes[json_file.name] = self._hash_text(json_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("Unable to hash knowledge file %s: %s", json_file, exc)
+        return hashes
+
+    def _vector_sources_for_profile(self, profile_id: str) -> set[str] | None:
+        """Return source filenames currently indexed in Chroma for one scope."""
+        try:
+            payload = self._get_vector_store().get(
+                where={"profile_id": profile_id},
+                include=["metadatas"],
+            )
+        except Exception as exc:
+            logger.warning("Unable to inspect vector metadata for %s: %s", profile_id, exc)
+            return None
+
+        sources: set[str] = set()
+        for metadata in payload.get("metadatas") or []:
+            if isinstance(metadata, dict) and metadata.get("source"):
+                sources.add(str(metadata["source"]))
+        return sources
+
+    def _delete_vector_source(self, source: str, profile_id: str) -> None:
+        """Delete all Chroma chunks for one source file and knowledge scope."""
+        self._get_vector_store().delete(
+            where={"$and": [{"source": source}, {"profile_id": profile_id}]}
+        )
+
+    def _sync_knowledge_dir(self, directory: Path, profile_id: str) -> bool:
+        """Synchronize md5 markers and vectors with files currently on disk."""
+        global _knowledge_sync_signatures
+        sync_key = f"{profile_id}:{directory.resolve()}"
+        signature = self._knowledge_dir_signature(directory)
+        if _knowledge_sync_signatures.get(sync_key) == signature:
+            return False
+
+        current_hashes = self._knowledge_hashes_by_source(directory)
+        current_sources = set(current_hashes)
+        vector_sources = self._vector_sources_for_profile(profile_id)
+
+        if vector_sources is not None:
+            for stale_source in sorted(vector_sources - current_sources):
+                try:
+                    self._delete_vector_source(stale_source, profile_id)
+                    logger.info(
+                        "Removed stale vector entries for %s in profile %s",
+                        stale_source,
+                        profile_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Unable to remove stale vector entries for %s/%s: %s",
+                        profile_id,
+                        stale_source,
+                        exc,
+                    )
+
+            indexed_hashes = {
+                current_hashes[source]
+                for source in vector_sources & current_sources
+            }
+        else:
+            indexed_hashes = set(current_hashes.values())
+
+        existing_hashes = self._read_md5_hashes(profile_id)
+        self._write_md5_hashes(profile_id, existing_hashes & indexed_hashes)
+        _knowledge_sync_signatures[sync_key] = signature
+        return True
+
+    def _refresh_knowledge_dir(self, directory: Path, profile_id: str) -> None:
+        """Synchronize a knowledge directory and index newly added files."""
+        changed = self._sync_knowledge_dir(directory, profile_id)
+        if changed:
+            self._load_knowledge_dir(directory, profile_id=profile_id)
+
+    def sync_knowledge_files(self, profile_id: str | None = None) -> None:
+        """Synchronize shared and profile-owned knowledge sidecars with files."""
+        self._refresh_knowledge_dir(self._knowledge_dir_for_profile("shared"), "shared")
+        if profile_id and profile_id != "shared":
+            self._refresh_knowledge_dir(self._knowledge_dir_for_profile(profile_id), profile_id)
+
     def _md5_file(self, profile_id: str = "shared") -> Path:
+        """Return the md5 marker file for shared or profile-owned knowledge."""
         if profile_id == "shared":
             return Path(md5_path)
         md5_dir = Path(md5_path).parent / "md5"
         md5_dir.mkdir(parents=True, exist_ok=True)
         return md5_dir / f"{profile_id}.txt"
 
-    def check_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> bool:
-        target = self._md5_file(profile_id)
-        if not target.exists():
-            target.write_text("", encoding="utf-8")
-            return False
+    def _md5_files_for_check(self, profile_id: str = "shared") -> list[Path]:
+        """Return md5 files that should be checked for duplicate knowledge."""
+        targets = [Path(md5_path)]
+        if profile_id != "shared":
+            targets.append(Path(md5_path).parent / "md5" / f"{profile_id}.txt")
+        return targets
 
-        md5_hex = hashlib.md5(input_str.encode(encoding=encoding)).hexdigest()
-        with open(target, "r", encoding="utf-8") as handle:
-            return any(line.strip() == md5_hex for line in handle.readlines())
+    def _hash_text(self, input_str: str, encoding: str = "utf-8") -> str:
+        """Hash knowledge content using the legacy md5 marker format."""
+        return hashlib.md5(input_str.encode(encoding=encoding)).hexdigest()
+
+    def check_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> bool:
+        """Return True when the content hash is new for shared + profile scopes."""
+        md5_hex = self._hash_text(input_str, encoding=encoding)
+        for target in self._md5_files_for_check(profile_id):
+            if not target.exists():
+                continue
+            with target.open("r", encoding="utf-8") as handle:
+                if any(line.strip() == md5_hex for line in handle):
+                    return False
+        return True
 
     def update_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> None:
-        md5_hex = hashlib.md5(input_str.encode(encoding=encoding)).hexdigest()
+        """Append a knowledge content hash to the target md5 marker file."""
+        md5_hex = self._hash_text(input_str, encoding=encoding)
         with open(self._md5_file(profile_id), "a", encoding="utf-8") as handle:
             handle.write(f"{md5_hex}\n")
 
+    def remove_md5(self, input_str: str, encoding: str = "utf-8", profile_id: str = "shared") -> bool:
+        """Remove a knowledge content hash from the profile md5 marker file."""
+        target = self._md5_file(profile_id)
+        if not target.exists():
+            return False
+
+        md5_hex = self._hash_text(input_str, encoding=encoding)
+        lines = target.read_text(encoding="utf-8").splitlines()
+        kept_lines = [line for line in lines if line.strip() != md5_hex]
+        removed = len(kept_lines) != len(lines)
+
+        if kept_lines:
+            target.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+        else:
+            target.unlink(missing_ok=True)
+        return removed
+
     def add_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
-        if self.check_md5(knowledge, profile_id=profile_id):
+        """Split, embed, and index one knowledge file for shared or profile scope."""
+        if not self.check_md5(knowledge, profile_id=profile_id):
             return f"[Failed]The {filename} already exists"
 
         if len(knowledge) > max_split_char_number:
-            knowledge_chunks: list[str] = self.spliter.split_text(knowledge)
+            knowledge_chunks: list[str] = self.splitter.split_text(knowledge)
         else:
             knowledge_chunks = [knowledge]
 
@@ -176,7 +361,15 @@ class Agent:
         self.update_md5(knowledge, profile_id=profile_id)
         return f"[Success]Add {filename} into vector database"
 
-    def format_func(self, docs: list[Document]) -> str:
+    def remove_knowledge(self, knowledge: str, filename: str, profile_id: str = "shared") -> str:
+        """Delete indexed chunks and md5 markers for one knowledge file."""
+        vector_store = self._get_vector_store()
+        vector_store.delete(where={"$and": [{"source": filename}, {"profile_id": profile_id}]})
+        self.remove_md5(knowledge, profile_id=profile_id)
+        return f"[Success]Remove {filename} from vector database"
+
+    def _format_docs(self, docs: list[Document]) -> str:
+        """Render retrieved Chroma documents into compact prompt references."""
         if not docs:
             return ""
 
@@ -191,6 +384,9 @@ class Agent:
         return "\n\n".join(parts)
 
     def _retrieve(self, question: str, k: int, profile_id: str | None = None) -> str:
+        """Retrieve shared and profile-owned knowledge for a chat question."""
+        self.sync_knowledge_files(profile_id)
+
         # Lazily load user knowledge on first retrieval for this profile
         global _user_knowledge_loaded
         if profile_id and profile_id != "shared" and profile_id not in _user_knowledge_loaded:
@@ -200,20 +396,24 @@ class Agent:
         try:
             search_kwargs: dict[str, Any] = {"k": k}
             if profile_id:
+                # Keep retrieval isolated: every profile sees global knowledge
+                # plus its own uploads, never another profile's files.
                 search_kwargs["filter"] = {"profile_id": {"$in": ["shared", profile_id]}}
             retriever = self._get_vector_store().as_retriever(search_kwargs=search_kwargs)
             docs = retriever.invoke(question)
-            return self.format_func(docs)
+            return self._format_docs(docs)
         except Exception as exc:
+            # Retrieval is optional context. Chat should degrade to history-only
+            # instead of failing when Chroma/Ollama embeddings are unavailable.
             logger.warning("RAG retrieval failed for profile=%s: %s", profile_id, exc)
             return ""
 
     async def _retrieve_async(self, question: str, k: int, profile_id: str | None = None) -> str:
-        """Async wrapper — runs the synchronous Chroma query in a thread executor
-        so it doesn't block the FastAPI event loop."""
+        """Run synchronous Chroma retrieval off the FastAPI event loop."""
         return await asyncio.to_thread(self._retrieve, question, k, profile_id)
 
     def _load_public_knowledge(self) -> None:
+        """Load bundled public knowledge into Chroma once per process."""
         global _public_knowledge_loaded
         if _public_knowledge_loaded:
             return
@@ -223,310 +423,186 @@ class Agent:
         if not public_dir.exists():
             return
 
-        for json_file in public_dir.glob("*.json"):
-            try:
-                content = json_file.read_text(encoding="utf-8")
-                self.add_knowledge(content, json_file.name, profile_id="shared")
-            except Exception:
-                pass
+        self._refresh_knowledge_dir(public_dir, profile_id="shared")
 
     def _load_user_knowledge(self, profile_id: str) -> None:
+        """Load one profile's uploaded knowledge into Chroma if present."""
         user_dir = Path(user_knowledge_path) / profile_id
         if not user_dir.exists():
             return
 
-        for json_file in user_dir.glob("*.json"):
+        self._refresh_knowledge_dir(user_dir, profile_id=profile_id)
+
+    def _load_knowledge_dir(self, directory: Path, profile_id: str) -> None:
+        """Index all JSON knowledge files from a directory for one scope."""
+        for json_file in directory.glob("*.json"):
             try:
                 content = json_file.read_text(encoding="utf-8")
                 self.add_knowledge(content, json_file.name, profile_id=profile_id)
             except Exception:
+                # A corrupt optional knowledge file should not prevent the app
+                # from starting; upload-time validation handles new files.
                 pass
 
-    def _build_messages(
-        self, question: str, context: str, has_tools: bool = False
-    ) -> list[dict[str, str]]:
-        prompt_template = system_prompt_with_tools if has_tools else system_prompt
-
-        # ── Knowledge context: RAG results from public + user vector stores ──
-        if context:
-            knowledge_context = (
-                "## Knowledge Base (retrieved references)\n"
-                f"{context}\n"
+    def _provider_config(self) -> dict[str, Any]:
+        """Resolve the active profile provider into a chat endpoint config."""
+        provider = self.settings.get("ai", {}).get("provider", "ollama")
+        if provider == "openai-compatible":
+            settings = self.settings.get("ai", {}).get("openaiCompatible", {})
+            api_key = (settings.get("apiKey") or "").strip()
+            base_url = (settings.get("baseUrl") or "").strip().rstrip("/")
+            chat_model = (settings.get("model") or "").strip()
+            if not api_key or not base_url or not chat_model:
+                raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
+            logger.info(
+                "LLM provider selected: profile=%s provider=%s model=%s base=%s",
+                self.session_id,
+                provider,
+                chat_model,
+                urlparse(base_url).netloc or base_url,
             )
-        else:
-            knowledge_context = ""
+            return {
+                "provider": provider,
+                "url": f"{base_url}/chat/completions",
+                "model": chat_model,
+                "headers": {"Authorization": f"Bearer {api_key}"},
+            }
 
-        # ── History context: recent conversation as a labeled text block ──
-        _refusal_patterns = [
-            "我无法直接访问", "我无法访问", "我没有权限",
-            "我无法直接查看", "我无法直接获取", "我没法直接",
-            "无法直接访问", "无法直接查看", "无法直接获取",
-            "I can't access", "I cannot access",
-        ]
-        filtered: list[str] = []
-        for message in self.messages[-10:]:
-            role = message.get("role", "")
-            content = message.get("content", "")
-
-            if role in ("tool_call", "tool_result", "tool"):
-                continue
-            if role == "assistant" and any(p in content for p in _refusal_patterns):
-                continue
-
-            tag = "assistant" if role == "assistant" else "user"
-            filtered.append(f"[{tag}]: {content}")
-
-        if filtered:
-            history_context = (
-                "## Conversation History\n"
-                + "\n".join(filtered)
-                + "\n"
-            )
-        else:
-            history_context = ""
-
-        # ── Assemble prompt ──
-        prompt_text = prompt_template.format(
-            knowledge_context=knowledge_context,
-            history_context=history_context,
+        settings = self.settings.get("ai", {}).get("ollama", {})
+        base_url = (settings.get("baseUrl") or "").strip().rstrip("/")
+        chat_model = (settings.get("model") or "").strip()
+        if not base_url or not chat_model:
+            raise RuntimeError("Ollama 接口缺少 baseUrl 或 model。")
+        logger.info(
+            "LLM provider selected: profile=%s provider=%s model=%s base=%s",
+            self.session_id,
+            "ollama",
+            chat_model,
+            urlparse(base_url).netloc or base_url,
         )
-        return [
-            {"role": "system", "content": prompt_text},
-            {"role": "user", "content": question},
-        ]
+        return {
+            "provider": "ollama",
+            "url": f"{base_url}/api/chat",
+            "model": chat_model,
+            "headers": None,
+        }
 
-    async def _ollama(self, messages: list[dict[str, str]]) -> str:
-        """Async version using httpx — does not block the event loop."""
-        ai_settings = self.settings.get("ai", {})
-        ollama_settings = ai_settings.get("ollama", {})
-        base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
-        chat_model = (ollama_settings.get("model") or model_name).strip() or model_name
-        payload = {"model": chat_model, "messages": messages, "stream": False}
-        response = await async_fetch_json(f"{base_url}/api/chat", method="POST", payload=payload)
-        return response.get("message", {}).get("content", "").strip()
-
-    async def _openai(self, messages: list[dict[str, str]]) -> str:
-        """Async version using httpx — does not block the event loop."""
-        ai_settings = self.settings.get("ai", {})
-        openai_settings = ai_settings.get("openaiCompatible", {})
-        api_key = (openai_settings.get("apiKey") or "").strip()
-        base_url = (openai_settings.get("baseUrl") or "").rstrip("/")
-        chat_model = (openai_settings.get("model") or "").strip()
-
-        if not api_key or not base_url or not chat_model:
-            raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
-
-        payload = {"model": chat_model, "messages": messages}
-        response = await async_fetch_json(
-            f"{base_url}/chat/completions",
-            method="POST",
-            payload=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        choices = response.get("choices") or []
-        if not choices:
-            raise RuntimeError("OpenAI 兼容接口未返回结果。")
-
-        content = choices[0].get("message", {}).get("content", "")
+    def _content_to_text(self, content: Any) -> str:
+        """Flatten provider message content into plain text."""
         if isinstance(content, list):
             return "".join(
-                part.get("text", "") if isinstance(part, dict) else str(part) for part in content
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
             ).strip()
-        return str(content).strip()
+        return str(content or "").strip()
 
-    async def _ollama_stream(self, messages: list[dict[str, str]]):
-        """Async version of _call_ollama_stream using httpx."""
-        ai_settings = self.settings.get("ai", {})
-        ollama_settings = ai_settings.get("ollama", {})
-        base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
-        chat_model = (ollama_settings.get("model") or model_name).strip() or model_name
-        payload = {"model": chat_model, "messages": messages, "stream": True}
-        async for line in async_fetch_stream_lines(f"{base_url}/api/chat", method="POST", payload=payload):
-            raw = line.strip()
-            if not raw:
-                continue
-            try:
-                chunk = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                yield content
-            if chunk.get("done", False):
-                break
+    def _parse_tool_calls(self, raw_calls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """Normalize provider tool call payloads into MCP call descriptors."""
+        tool_calls: list[dict[str, Any]] = []
+        for raw_call in raw_calls or []:
+            func = raw_call.get("function", {})
+            args = func.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            tool_calls.append({
+                "id": raw_call.get("id", "call_1"),
+                "name": func.get("name", ""),
+                "arguments": args,
+            })
+        return tool_calls
 
-    async def _openai_stream(self, messages: list[dict[str, str]]):
-        """Async version of _call_openai_compatible_stream using httpx."""
-        ai_settings = self.settings.get("ai", {})
-        openai_settings = ai_settings.get("openaiCompatible", {})
-        api_key = (openai_settings.get("apiKey") or "").strip()
-        base_url = (openai_settings.get("baseUrl") or "").rstrip("/")
-        chat_model = (openai_settings.get("model") or "").strip()
+    def _provider_payload(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        tool_defs: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Build a provider-compatible chat payload for streaming or tool calls."""
+        payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
+        if tool_defs:
+            payload["tools"] = tool_defs
+        return payload
 
-        if not api_key or not base_url or not chat_model:
-            raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
-
-        payload = {"model": chat_model, "messages": messages, "stream": True}
-        headers = {"Authorization": f"Bearer {api_key}"}
-        async for line in async_fetch_stream_lines(
-            f"{base_url}/chat/completions", method="POST", payload=payload, headers=headers
-        ):
-            raw = line.strip()
-            if not raw or not raw.startswith("data: "):
-                continue
-            data_str = raw[6:]
-            if data_str == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            content = delta.get("content", "")
-            if content:
-                yield content
-
-    async def _provider_stream(self, messages: list[dict[str, str]]):
-        """Async generator: yield tokens from the configured provider."""
-        provider = self.settings.get("ai", {}).get("provider", "ollama")
-        if provider == "openai-compatible":
-            async for token in self._openai_stream(messages):
-                yield token
-        else:
-            async for token in self._ollama_stream(messages):
-                yield token
-
-    async def _ollama_tools(
-        self, messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]]
-    ) -> list[dict[str, Any]] | str:
-        """Async version using httpx — does not block the event loop."""
-        ai_settings = self.settings.get("ai", {})
-        ollama_settings = ai_settings.get("ollama", {})
-        base_url = (ollama_settings.get("baseUrl") or ollama_base_url).rstrip("/")
-        chat_model = (ollama_settings.get("model") or model_name).strip() or model_name
-        payload = {
-            "model": chat_model,
-            "messages": messages,
-            "tools": tool_defs,
-            "stream": False,
-        }
-        logger.info(
-            "Ollama tool call: model=%s tools=%d messages=%d url=%s",
-            chat_model, len(tool_defs), len(messages), base_url,
-        )
-        print(
-            f"[Agent] calling Ollama with {len(tool_defs)} tools, "
-            f"{len(messages)} messages, model={chat_model}",
-            flush=True,
-        )
+    async def _provider_token_stream(
+        self,
+        config: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> AsyncIterator[str]:
+        """Yield streamed token text from the active provider endpoint."""
         try:
-            response = await async_fetch_json(f"{base_url}/api/chat", method="POST", payload=payload)
-        except Exception:
-            dump_path = Path(__file__).parent / "_ollama_payload_dump.json"
-            try:
-                dump_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                print(f"[Agent] 400 payload dumped to {dump_path}", flush=True)
-            except Exception:
-                pass
-            raise
-        msg = response.get("message", {})
-        if msg.get("tool_calls"):
-            print(f"[Agent] Ollama returned {len(msg['tool_calls'])} tool_calls", flush=True)
-            logger.info("Ollama returned %d tool_calls", len(msg["tool_calls"]))
-            results: list[dict[str, Any]] = []
-            for tc in msg["tool_calls"]:
-                func = tc.get("function", {})
-                args = func.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                results.append({
-                    "id": tc.get("id", ""),
-                    "name": func.get("name", ""),
-                    "arguments": args,
-                })
-            return results
-        content = msg.get("content", "").strip()
-        print(f"[Agent] Ollama returned text (no tool_calls): {content[:120]}...", flush=True)
-        logger.info("Ollama returned text (no tool_calls): %s", content[:200])
-        return content
+            async for line in async_fetch_stream_lines(
+                config["url"],
+                method="POST",
+                payload=payload,
+                headers=config["headers"],
+                timeout=llm_http_timeout,
+            ):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    content, done = _stream_token_from_line(config["provider"], raw)
+                except json.JSONDecodeError:
+                    continue
+                if done:
+                    break
+                if content:
+                    yield content
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                _llm_timeout_message(config["provider"], config["model"])
+            ) from exc
 
-    async def _openai_tools(
-        self, messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]]
-    ) -> list[dict[str, Any]] | str:
-        """Async version using httpx — does not block the event loop."""
-        ai_settings = self.settings.get("ai", {})
-        openai_settings = ai_settings.get("openaiCompatible", {})
-        api_key = (openai_settings.get("apiKey") or "").strip()
-        base_url = (openai_settings.get("baseUrl") or "").rstrip("/")
-        chat_model = (openai_settings.get("model") or "").strip()
+    async def _provider_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tool_defs: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+    ) -> dict[str, Any] | AsyncIterator[str]:
+        """Call the active provider once, optionally returning a token stream."""
+        config = self._provider_config()
+        payload = self._provider_payload(config["model"], messages, stream, tool_defs)
 
-        if not api_key or not base_url or not chat_model:
-            raise RuntimeError("OpenAI 兼容接口缺少 apiKey、baseUrl 或 model。")
+        if stream:
+            return self._provider_token_stream(config, payload)
 
-        payload = {"model": chat_model, "messages": messages, "tools": tool_defs}
-        response = await async_fetch_json(
-            f"{base_url}/chat/completions",
-            method="POST",
-            payload=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        choice = (response.get("choices") or [None])[0]
-        if not choice:
-            raise RuntimeError("OpenAI 兼容接口未返回结果。")
+        try:
+            response = await async_fetch_json(
+                config["url"],
+                method="POST",
+                payload=payload,
+                headers=config["headers"],
+                timeout=llm_http_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                _llm_timeout_message(config["provider"], config["model"])
+            ) from exc
+        message = self._message_from_response(config["provider"], response)
+        return {
+            "content": self._content_to_text(message.get("content", "")),
+            "tool_calls": self._parse_tool_calls(message.get("tool_calls")),
+        }
 
-        msg = choice.get("message", {})
-        if msg.get("tool_calls"):
-            results: list[dict[str, Any]] = []
-            for tc in msg["tool_calls"]:
-                func = tc.get("function", {})
-                args = func.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                results.append({
-                    "id": tc.get("id", ""),
-                    "name": func.get("name", ""),
-                    "arguments": args,
-                })
-            return results
-        return str(msg.get("content", "")).strip()
-
-    async def _provider_tools(
-        self, messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]]
-    ) -> list[dict[str, Any]] | str:
-        """Async version — does not block the event loop."""
-        provider = self.settings.get("ai", {}).get("provider", "ollama")
+    def _message_from_response(self, provider: str, response: dict[str, Any]) -> dict[str, Any]:
+        """Extract the assistant message object from provider-specific JSON."""
         if provider == "openai-compatible":
-            return await self._openai_tools(messages, tool_defs)
-        return await self._ollama_tools(messages, tool_defs)
-
-    async def _provider(self, messages: list[dict[str, str]]) -> str:
-        """Async version — does not block the event loop."""
-        provider = self.settings.get("ai", {}).get("provider", "ollama")
-        if provider == "openai-compatible":
-            return await self._openai(messages)
-        return await self._ollama(messages)
-
-    # ------------------------------------------------------------------
-    # Tool-calling helpers
-    # ------------------------------------------------------------------
+            choice = (response.get("choices") or [None])[0]
+            if not choice:
+                raise RuntimeError("OpenAI 兼容接口未返回结果。")
+            return choice.get("message", {})
+        return response.get("message", {})
 
     def _build_tool_call_messages(
         self, messages: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Append assistant tool_calls and tool result messages to *messages*.
-        Returns list of (tool_name, tool_args, tool_call_id) tuples for execution."""
+        Returns the provider-formatted tool call entries that were appended."""
         provider = self.settings.get("ai", {}).get("provider", "ollama")
         tool_entries: list[dict[str, Any]] = []
         for tc in tool_calls:
@@ -551,158 +627,153 @@ class Agent:
         })
         return tool_entries
 
-    # ------------------------------------------------------------------
-    # Non-streaming tool loop
-    # ------------------------------------------------------------------
-
-    async def chat(self, question: str, k: int = 3) -> str:
-        context = await self._retrieve_async(question, k, profile_id=self.session_id)
-        messages: list[dict[str, Any]] = self._build_messages(question, context, has_tools=True)
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        if self._mcp_client is None:
-            response = await self._provider(messages)
-            self._persist_chat(question, response, timestamp, messages)
-            return response
-
-        tool_defs = self._mcp_client.get_tool_definitions()
-        tool_history: list[dict[str, Any]] = []  # for persistence
-
-        for _turn in range(5):
-            result = await self._provider_tools(messages, tool_defs)
-
-            if isinstance(result, str):
-                response = result
-                self._persist_chat(question, response, timestamp, messages, tool_history)
-                return response
-
-            # Multiple tool calls in one turn
-            entries = self._build_tool_call_messages(messages, result)
-            for entry in entries:
-                tool_history.append({"role": "tool_call", "content": json.dumps(entry, ensure_ascii=False)})
-
-            for tc in result:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("arguments", {})
-                try:
-                    tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
-                except Exception as exc:
-                    tool_result = f"工具调用失败: {exc}"
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", "call_1"),
-                    "content": tool_result,
-                })
-                tool_history.append({"role": "tool_result", "content": tool_result})
-
-        # Max turns reached — ask for final answer
+    def _request_final_answer(self, messages: list[dict[str, Any]]) -> None:
+        """Append a prompt instruction that forbids further tool-call markup."""
         messages.append({
             "role": "user",
-            "content": "请基于以上工具调用结果给出最终答案。",
+            "content": FINAL_ANSWER_ONLY_INSTRUCTION,
         })
-        response = await self._provider(messages)
-        self._persist_chat(question, response, timestamp, messages, tool_history)
-        return response
-
-    # ------------------------------------------------------------------
-    # Streaming tool loop (true async generator — no event loop nesting)
-    # ------------------------------------------------------------------
 
     async def chat_stream(self, question: str, k: int = 3):
-        """Async generator: yield SSE events for streaming chat with MCP tools."""
+        """Stream a full chat turn with optional RAG context and MCP tool calls."""
         context = await self._retrieve_async(question, k, profile_id=self.session_id)
-        messages: list[dict[str, Any]] = self._build_messages(question, context, has_tools=True)
-        timestamp = datetime.now(timezone.utc).isoformat()
+        tool_defs = self._mcp_client.get_tool_definitions() if self._mcp_client else []
+
+        messages: list[dict[str, Any]] = build_prompt_messages(
+            question=question,
+            context=context,
+            history=self.messages,
+            settings=self.settings,
+            has_tools=bool(tool_defs),
+        )
+        timestamp = utc_now()
         tool_history: list[dict[str, Any]] = []
         yield {"type": "meta", "user_message": question, "timestamp": timestamp}
 
-        if self._mcp_client is None:
-            print("[Agent] No MCP client — streaming without tools", flush=True)
-            logger.info("No MCP client — streaming without tools")
-            full = ""
-            try:
-                async for token in self._provider_stream(messages):
-                    full += token
-                    yield {"type": "token", "content": token}
-            except Exception as exc:
-                yield {"type": "error", "content": str(exc)}
-                return
-            yield {"type": "done", "content": full}
-            self._persist_chat(question, full, timestamp, messages)
+        if not tool_defs:
+            logger.info("Streaming without MCP tools")
+            async for event in self._emit_final_answer(messages, question, timestamp, tool_history):
+                yield event
             return
 
-        tool_defs = self._mcp_client.get_tool_definitions()
-        print(f"[Agent] MCP client ready, {len(tool_defs)} tool definitions", flush=True)
         logger.info("MCP streaming with %d tool definitions", len(tool_defs))
 
-        for _turn in range(5):
-            result = await self._provider_tools(messages, tool_defs)
+        # Tool calls must be resolved before the final answer can be streamed.
+        for _turn in range(MAX_TOOL_TURNS):
+            result = await self._provider_chat(messages, tool_defs=tool_defs)
+            tool_calls = result.get("tool_calls") or []
 
-            if isinstance(result, str):
-                full = ""
-                try:
-                    async for token in self._provider_stream(messages):
-                        full += token
-                        yield {"type": "token", "content": token}
-                except Exception as exc:
-                    yield {"type": "error", "content": str(exc)}
+            if not tool_calls:
+                if looks_like_tool_markup(result.get("content", "")):
+                    for event in self._emit_tool_markup_fallback(question, timestamp, tool_history):
+                        yield event
                     return
-                yield {"type": "done", "content": full}
-                self._persist_chat(question, full, timestamp, messages, tool_history)
+                self._request_final_answer(messages)
+                async for event in self._emit_final_answer(messages, question, timestamp, tool_history):
+                    yield event
                 return
 
-            entries = self._build_tool_call_messages(messages, result)
+            entries = self._build_tool_call_messages(messages, tool_calls)
             for entry in entries:
                 tool_history.append({"role": "tool_call", "content": json.dumps(entry, ensure_ascii=False)})
 
-            for tc in result:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("arguments", {})
-                yield {"type": "tool_start", "tool": tool_name}
+            async for event in self._run_tool_calls(messages, tool_calls, tool_history):
+                yield event
 
-                try:
-                    tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
-                except Exception as exc:
-                    tool_result = f"工具调用失败: {exc}"
+        self._request_final_answer(messages)
+        async for event in self._emit_final_answer(messages, question, timestamp, tool_history):
+            yield event
 
-                yield {"type": "tool_result", "tool": tool_name, "result": tool_result}
+    def _emit_tool_markup_fallback(
+        self,
+        question: str,
+        timestamp: str,
+        tool_history: list[dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
+        """Emit a safe fallback when a model prints tool markup as text."""
+        fallback = tool_markup_fallback(tool_history)
+        yield {"type": "token", "content": fallback}
+        yield {"type": "done", "content": fallback}
+        self._persist_chat(question, fallback, timestamp, tool_history)
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", "call_1"),
-                    "content": tool_result,
-                })
-                tool_history.append({"role": "tool_result", "content": tool_result})
-
-        messages.append({
-            "role": "user",
-            "content": "请基于以上工具调用结果给出最终答案。",
-        })
+    async def _emit_final_answer(
+        self,
+        messages: list[dict[str, Any]],
+        question: str,
+        timestamp: str,
+        tool_history: list[dict[str, Any]],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the final answer while filtering provider tool-call markup."""
         full = ""
+        prefix_buffer = ""
+        prefix_released = False
+        blocked_tool_markup = False
+
         try:
-            async for token in self._provider_stream(messages):
+            token_source = await self._provider_chat(messages, stream=True)
+            async for token in token_source:
                 full += token
-                yield {"type": "token", "content": token}
+                if prefix_released:
+                    yield {"type": "token", "content": token}
+                    continue
+
+                prefix_buffer += token
+                if looks_like_tool_markup(prefix_buffer):
+                    blocked_tool_markup = True
+                    continue
+                if should_buffer_tool_markup(prefix_buffer):
+                    continue
+                prefix_released = True
+                yield {"type": "token", "content": prefix_buffer}
+                prefix_buffer = ""
         except Exception as exc:
             yield {"type": "error", "content": str(exc)}
             return
-        yield {"type": "done", "content": full}
-        self._persist_chat(question, full, timestamp, messages, tool_history)
 
-    # ------------------------------------------------------------------
-    # Chat persistence
-    # ------------------------------------------------------------------
+        if blocked_tool_markup or looks_like_tool_markup(full):
+            for event in self._emit_tool_markup_fallback(question, timestamp, tool_history):
+                yield event
+            return
+
+        if prefix_buffer:
+            yield {"type": "token", "content": prefix_buffer}
+        yield {"type": "done", "content": full}
+        self._persist_chat(question, full, timestamp, tool_history)
+
+    async def _run_tool_calls(
+        self,
+        messages: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
+        tool_history: list[dict[str, Any]],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Execute MCP tool calls and append tool results back into the prompt."""
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            tool_args = tc.get("arguments", {})
+            yield {"type": "tool_start", "tool": tool_name}
+
+            try:
+                tool_result = await self._mcp_client.call_tool(tool_name, tool_args)
+            except Exception as exc:
+                tool_result = f"工具调用失败: {exc}"
+
+            yield {"type": "tool_result", "tool": tool_name, "result": tool_result}
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", "call_1"),
+                "content": tool_result,
+            })
+            tool_history.append({"role": "tool_result", "content": tool_result})
 
     def _persist_chat(
         self,
         question: str,
         response: str,
         timestamp: str,
-        messages: list[dict[str, Any]],
         tool_history: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Save user question, assistant response, and any tool messages to history."""
+        """Persist the user turn, optional tool history, and assistant answer."""
         history = self.messages
         history.append({"role": "user", "content": question, "timestamp": timestamp})
         if tool_history:
@@ -710,7 +781,7 @@ class Agent:
         history.append({
             "role": "assistant",
             "content": response,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": utc_now(),
         })
         self._write_messages(history)
 

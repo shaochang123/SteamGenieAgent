@@ -1,8 +1,10 @@
-# SteamGenieMcp
+# SteamGenieAgent
 
 Local Steam AI workspace with a Vue 2 dashboard, a FastAPI backend, per-user memory, and Steam profile/store cards.
 
 Watch [INSTALL](./INSTALL.md) to configure the project
+
+Detailed module map and system diagrams: [Architecture](./docs/architecture.md)
 
 **English** | [中文说明](./README_CN.md)
 

@@ -93,7 +93,7 @@ export default {
       try {
         const response = await getKnowledge(this.profileId)
         this.files = response.data || { public: [], user: [] }
-      } catch (_) {
+      } catch {
         this.files = { public: [], user: [] }
       }
     },

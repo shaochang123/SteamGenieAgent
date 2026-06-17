@@ -13,9 +13,9 @@
     >
       <div class="message-bubble">
         <p class="message-label">
-          {{ message.role === 'tool_call' ? '工具调用' : message.role === 'tool_result' ? '工具结果' : message.role === 'assistant' ? 'AI' : '你' }}
+          {{ messageLabel(message.role) }}
         </p>
-        <div v-if="message.role === 'tool_call' || message.role === 'tool_result'" class="message-body message-body--tool">
+        <div v-if="isToolMessage(message.role)" class="message-body message-body--tool">
           {{ message.content }}
         </div>
         <div v-else class="message-body" v-html="renderMarkdown(message.content)"></div>
@@ -33,10 +33,27 @@
 <script>
 import MarkdownIt from 'markdown-it'
 
+// Messages are rendered with v-html after Markdown conversion. Raw HTML stays
+// disabled here, and links are forced into isolated new tabs below.
 const markdown = new MarkdownIt({
+  html: false,
   breaks: true,
   linkify: true,
 })
+const MESSAGE_LABELS = { tool_call: '工具调用', tool_result: '工具结果', assistant: 'AI' }
+
+const defaultLinkOpen =
+  markdown.renderer.rules.link_open ||
+  function renderLinkOpen(tokens, idx, options, env, self) {
+    return self.renderToken(tokens, idx, options)
+  }
+
+markdown.renderer.rules.link_open = function safeLinkOpen(tokens, idx, options, env, self) {
+  const token = tokens[idx]
+  token.attrSet('target', '_blank')
+  token.attrSet('rel', 'noopener noreferrer')
+  return defaultLinkOpen(tokens, idx, options, env, self)
+}
 
 export default {
   name: 'MessageList',
@@ -69,6 +86,8 @@ export default {
     this.scrollToBottom()
   },
   methods: {
+    isToolMessage(role) { return role === 'tool_call' || role === 'tool_result' },
+    messageLabel(role) { return MESSAGE_LABELS[role] || '你' },
     renderMarkdown(content) {
       return markdown.render(content || '')
     },

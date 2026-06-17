@@ -1,5 +1,5 @@
 <template>
-  <div id="app">
+  <div id="app" :class="deviceClasses">
     <div class="background background--top"></div>
     <div class="background background--bottom"></div>
 
@@ -17,17 +17,17 @@
       <section class="panel panel--chat">
         <ChatPane
           :profile="state.selectedProfile"
-          :messages="state.messages"
-          :loading="state.loading.conversation"
-          :sending="state.loading.sending"
-          :error="state.error.chat"
-          :streaming-content="state.streamingContent"
+          :messages="activeChatSession.messages"
+          :loading="activeChatSession.loading"
+          :sending="activeChatSession.sending"
+          :error="activeChatSession.error"
+          :streaming-content="activeChatSession.streamingContent"
           @open-settings="state.dialogs.settings = true"
           @send-message="handleSendMessage"
         />
       </section>
 
-      <section class="panel panel--steam">
+      <section v-if="!usesSteamDrawer" class="panel panel--steam">
         <div class="steam-stack">
           <SteamOverviewCard
             :overview="state.steamOverview"
@@ -39,16 +39,49 @@
       </section>
     </main>
 
-    <p v-if="state.error.profiles" class="floating-error">
-      {{ state.error.profiles }}
-    </p>
+    <button
+      v-if="usesSteamDrawer && !state.ui.steamDrawerOpen"
+      class="steam-drawer-toggle"
+      type="button"
+      @click="openSteamDrawer"
+    >
+      <span>Steam</span>
+      <strong>玩家状态</strong>
+    </button>
 
-    <p v-if="state.error.settings" class="floating-error floating-error--bottom">
-      {{ state.error.settings }}
-    </p>
+    <div
+      v-if="usesSteamDrawer && state.ui.steamDrawerOpen"
+      class="steam-drawer-backdrop"
+      @click="closeSteamDrawer"
+    ></div>
 
-    <p v-if="state.error.steam" class="floating-error floating-error--bottom-secondary">
-      {{ state.error.steam }}
+    <aside
+      v-if="usesSteamDrawer"
+      class="steam-drawer"
+      :class="{ 'steam-drawer--open': state.ui.steamDrawerOpen }"
+      :aria-hidden="!state.ui.steamDrawerOpen"
+    >
+      <header class="steam-drawer__header">
+        <div>
+          <p class="eyebrow">Steam</p>
+          <h2>玩家状态</h2>
+        </div>
+        <button class="steam-drawer__close" type="button" @click="closeSteamDrawer">
+          关闭
+        </button>
+      </header>
+      <div class="steam-stack">
+        <SteamOverviewCard
+          :overview="state.steamOverview"
+          :loading="state.loading.steam"
+          @refresh="refreshSteamData"
+        />
+        <SteamDealsCard :deals="state.steamDeals" :loading="state.loading.steam" />
+      </div>
+    </aside>
+
+    <p v-for="error in floatingErrors" :key="error.key" :class="['floating-error', error.className]">
+      {{ error.text }}
     </p>
 
     <CreateProfileDialog
@@ -73,13 +106,8 @@
 import {
   createProfile,
   deleteProfile,
-  getProfile,
-  getProfileMessages,
-  getSteamDeals,
-  getSteamOverview,
   listProfiles,
   normalizeError,
-  sendChatStream,
   updateProfileConfig,
 } from './api/api'
 import ChatPane from './components/ChatPane.vue'
@@ -88,7 +116,17 @@ import ProfileSidebar from './components/ProfileSidebar.vue'
 import SettingsSheet from './components/SettingsSheet.vue'
 import SteamDealsCard from './components/SteamDealsCard.vue'
 import SteamOverviewCard from './components/SteamOverviewCard.vue'
-import { appStore, createEmptyDeals, createEmptyOverview } from './store/appStore'
+import { watchDeviceMode } from './services/deviceMode'
+import { loadProfileContext } from './services/profileContext'
+import { validateProfileSettings } from './services/settingsValidation'
+import { loadSteamCards, resetSteamCards } from './services/steamCards'
+import { appStore } from './store/appStore'
+import {
+  activeChatSession,
+  deleteChatSession,
+  ensureChatSession,
+  sendProfileMessage,
+} from './store/chatSessions'
 
 export default {
   name: 'App',
@@ -103,33 +141,57 @@ export default {
   data() {
     return {
       state: appStore,
+      stopDeviceWatcher: null,
     }
   },
   async created() {
+    this.stopDeviceWatcher = watchDeviceMode((device) => {
+      Object.assign(this.state.device, device)
+      if (!['mobile', 'tablet'].includes(device.mode)) {
+        this.state.ui.steamDrawerOpen = false
+      }
+    })
     await this.loadProfiles()
   },
+  beforeDestroy() {
+    this.stopDeviceWatcher?.()
+  },
+  computed: {
+    activeChatSession() {
+      return activeChatSession(this.state)
+    },
+    deviceClasses() {
+      const device = this.state.device
+      return [
+        `device-${device.mode || 'desktop'}`,
+        device.isTouch ? 'device-touch' : 'device-pointer',
+      ]
+    },
+    isMobileDevice() {
+      return this.state.device.mode === 'mobile'
+    },
+    usesSteamDrawer() {
+      return this.state.device.mode === 'mobile' || this.state.device.mode === 'tablet'
+    },
+    floatingErrors() {
+      return [
+        { key: 'profiles', text: this.state.error.profiles, className: '' },
+        { key: 'settings', text: this.state.error.settings, className: 'floating-error--bottom' },
+        { key: 'steam', text: this.state.error.steam, className: 'floating-error--bottom-secondary' },
+      ].filter((error) => error.text)
+    },
+  },
   methods: {
-    validateSettings(payload) {
-      if (!payload || !payload.ai) {
-        return '缺少 AI 配置。'
-      }
-
-      if (payload.ai.provider === 'ollama') {
-        if (!payload.ai.ollama?.baseUrl || !payload.ai.ollama?.model) {
-          return '选择 Ollama 时需要填写 Base URL 和 Model。'
-        }
-        return ''
-      }
-
-      if (
-        !payload.ai.openaiCompatible?.apiKey ||
-        !payload.ai.openaiCompatible?.baseUrl ||
-        !payload.ai.openaiCompatible?.model
-      ) {
-        return '选择 OpenAI 兼容接口时需要填写 API Key、Base URL 和 Model。'
-      }
-
-      return ''
+    openSteamDrawer() {
+      this.state.ui.steamDrawerOpen = true
+      this.state.ui.steamDrawerTouched = true
+    },
+    closeSteamDrawer() {
+      this.state.ui.steamDrawerOpen = false
+      this.state.ui.steamDrawerTouched = true
+    },
+    isSelectedProfile(profileId) {
+      return this.state.selectedProfileId === profileId
     },
     async refreshProfileSummaries(preferredProfileId) {
       const response = await listProfiles()
@@ -153,9 +215,40 @@ export default {
     clearSelectedProfileState() {
       this.state.selectedProfileId = ''
       this.state.selectedProfile = null
-      this.state.messages = []
-      this.state.steamOverview = createEmptyOverview()
-      this.state.steamDeals = createEmptyDeals()
+      resetSteamCards(this.state)
+    },
+    async loadSteamForProfile(profileId) {
+      this.state.loading.steam = true
+      this.state.error.steam = ''
+
+      try {
+        const steamCards = await loadSteamCards(profileId)
+        if (!this.isSelectedProfile(profileId)) {
+          return
+        }
+
+        this.state.steamOverview = steamCards.overview
+        this.state.steamDeals = steamCards.deals
+        this.state.error.steam = steamCards.error
+      } finally {
+        if (this.isSelectedProfile(profileId)) {
+          this.state.loading.steam = false
+        }
+      }
+    },
+    async loadConversationForProfile(profileId, chatSession) {
+      try {
+        const context = await loadProfileContext(profileId)
+        if (this.isSelectedProfile(profileId)) {
+          this.state.selectedProfile = context.profile
+        }
+        if (!chatSession.sending) {
+          chatSession.messages = context.messages
+        }
+        chatSession.error = context.error
+      } finally {
+        chatSession.loading = false
+      }
     },
     async loadProfiles(selectProfileId) {
       this.state.loading.profiles = true
@@ -186,64 +279,16 @@ export default {
         return
       }
 
+      const chatSession = ensureChatSession(this.state, profileId)
       this.state.selectedProfileId = profileId
-      this.state.loading.conversation = true
-      this.state.loading.steam = true
-      this.state.error.chat = ''
-      this.state.error.steam = ''
+      chatSession.loading = true
+      chatSession.error = ''
 
       // Load conversation data and Steam data independently.
       // Conversation (profile + messages) must render immediately;
       // slow Steam API calls must not block it.
-      const loadConversation = (async () => {
-        try {
-          const [profileRes, messagesRes] = await Promise.allSettled([
-            getProfile(profileId),
-            getProfileMessages(profileId),
-          ])
-
-          if (profileRes.status === 'fulfilled') {
-            this.state.selectedProfile = profileRes.value.data.profile
-          } else {
-            this.state.selectedProfile = null
-            this.state.error.chat = normalizeError(profileRes.reason)
-          }
-
-          if (messagesRes.status === 'fulfilled') {
-            this.state.messages = messagesRes.value.data.messages || []
-          } else {
-            this.state.messages = []
-            this.state.error.chat = this.state.error.chat || normalizeError(messagesRes.reason)
-          }
-        } finally {
-          this.state.loading.conversation = false
-        }
-      })()
-
-      const loadSteam = (async () => {
-        try {
-          const [overviewRes, dealsRes] = await Promise.allSettled([
-            getSteamOverview(profileId),
-            getSteamDeals(profileId),
-          ])
-
-          if (overviewRes.status === 'fulfilled') {
-            this.state.steamOverview = overviewRes.value.data || createEmptyOverview()
-          } else {
-            this.state.steamOverview = createEmptyOverview()
-            this.state.error.steam = normalizeError(overviewRes.reason)
-          }
-
-          if (dealsRes.status === 'fulfilled') {
-            this.state.steamDeals = dealsRes.value.data || createEmptyDeals()
-          } else {
-            this.state.steamDeals = createEmptyDeals()
-            this.state.error.steam = this.state.error.steam || normalizeError(dealsRes.reason)
-          }
-        } finally {
-          this.state.loading.steam = false
-        }
-      })()
+      const loadConversation = this.loadConversationForProfile(profileId, chatSession)
+      const loadSteam = this.loadSteamForProfile(profileId)
 
       await Promise.all([loadConversation, loadSteam])
     },
@@ -282,7 +327,9 @@ export default {
       )
 
       try {
-        await deleteProfile(this.state.selectedProfileId)
+        const deletedProfileId = this.state.selectedProfileId
+        await deleteProfile(deletedProfileId)
+        deleteChatSession(this.state, deletedProfileId)
         this.closeSettings()
         if (nextProfile) {
           await this.loadProfiles(nextProfile.id)
@@ -301,7 +348,7 @@ export default {
         return
       }
 
-      const validationError = this.validateSettings(payload)
+      const validationError = validateProfileSettings(payload)
       if (validationError) {
         this.state.error.settings = validationError
         return
@@ -329,123 +376,18 @@ export default {
         return
       }
 
-      this.state.loading.sending = true
-      this.state.error.chat = ''
-      this.state.streamingContent = ''
-
-      // Show user message immediately
-      const timestamp = new Date().toISOString()
-      this.state.messages.push({
-        role: 'user',
-        content: question,
-        timestamp,
+      const profileId = this.state.selectedProfileId
+      await sendProfileMessage(this.state, profileId, question, {
+        onDone: () => this.refreshProfileSummaries(),
       })
-
-      // Placeholder for assistant response — we track a reference to the
-      // placeholder object so tool-call inserts before it don't invalidate
-      // index-based access in callbacks.
-      const assistantPlaceholder = {
-        role: 'assistant',
-        content: '',
-        timestamp: '',
-      }
-      this.state.messages.push(assistantPlaceholder)
-
-      // Track pending tool-result placeholder indices for correct update
-      const pendingToolResults = []
-
-      try {
-        await sendChatStream(this.state.selectedProfileId, question, 3, {
-          onToken: (content) => {
-            this.state.streamingContent += content
-            assistantPlaceholder.content += content
-          },
-          onDone: () => {
-            // Token-by-token accumulation already built the full response.
-            assistantPlaceholder.timestamp = new Date().toISOString()
-            this.state.streamingContent = ''
-            this.state.loading.sending = false
-            this.refreshProfileSummaries(this.state.selectedProfileId)
-          },
-          onError: (error) => {
-            // Remove the assistant placeholder on error
-            const idx = this.state.messages.indexOf(assistantPlaceholder)
-            if (idx !== -1) {
-              this.state.messages.splice(idx, 1)
-            }
-            this.state.streamingContent = ''
-            this.state.error.chat = error
-            this.state.loading.sending = false
-          },
-          onToolStart: (tool) => {
-            // Insert tool_call and tool_result BEFORE the assistant placeholder
-            const placeholderIdx = this.state.messages.indexOf(assistantPlaceholder)
-            if (placeholderIdx === -1) return
-            this.state.messages.splice(placeholderIdx, 0, {
-              role: 'tool_call',
-              content: `正在调用: ${tool}`,
-              timestamp: new Date().toISOString(),
-            })
-            const resultIdx = placeholderIdx + 1
-            this.state.messages.splice(resultIdx, 0, {
-              role: 'tool_result',
-              content: '等待结果...',
-              timestamp: new Date().toISOString(),
-            })
-            pendingToolResults.push({ tool, index: resultIdx })
-          },
-          onToolResult: (tool, result) => {
-            // Update the matching tool_result placeholder by tracked index
-            const entry = pendingToolResults.find(
-              (e) => e.tool === tool &&
-                this.state.messages[e.index]?.content === '等待结果...'
-            )
-            if (entry && this.state.messages[entry.index]) {
-              this.state.messages[entry.index].content = result.length > 500
-                ? result.slice(0, 500) + '...'
-                : result
-            }
-          },
-        })
-      } catch (error) {
-        const idx = this.state.messages.indexOf(assistantPlaceholder)
-        if (idx !== -1) {
-          this.state.messages.splice(idx, 1)
-        }
-        this.state.streamingContent = ''
-        this.state.error.chat = normalizeError(error)
-        this.state.loading.sending = false
-      }
     },
     async refreshSteamData() {
       if (!this.state.selectedProfileId) {
         return
       }
 
-      this.state.loading.steam = true
-      this.state.error.steam = ''
-      try {
-        const [overviewRes, dealsRes] = await Promise.allSettled([
-          getSteamOverview(this.state.selectedProfileId),
-          getSteamDeals(this.state.selectedProfileId),
-        ])
-
-        if (overviewRes.status === 'fulfilled') {
-          this.state.steamOverview = overviewRes.value.data || createEmptyOverview()
-        } else {
-          this.state.steamOverview = createEmptyOverview()
-          this.state.error.steam = normalizeError(overviewRes.reason)
-        }
-
-        if (dealsRes.status === 'fulfilled') {
-          this.state.steamDeals = dealsRes.value.data || createEmptyDeals()
-        } else {
-          this.state.steamDeals = createEmptyDeals()
-          this.state.error.steam = this.state.error.steam || normalizeError(dealsRes.reason)
-        }
-      } finally {
-        this.state.loading.steam = false
-      }
+      const profileId = this.state.selectedProfileId
+      await this.loadSteamForProfile(profileId)
     },
   },
 }
@@ -454,6 +396,7 @@ export default {
 <style lang="less">
 :root {
   color-scheme: light;
+  --app-height: 100vh;
 }
 
 * {
@@ -464,6 +407,8 @@ html,
 body,
 #app {
   min-height: 100%;
+  width: 100%;
+  max-width: 100%;
 }
 
 body {
@@ -471,6 +416,7 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
   color: #102542;
   background: #eef4fb;
+  overflow-x: hidden;
 }
 
 button,
@@ -485,7 +431,9 @@ a {
 
 #app {
   position: relative;
-  min-height: 100vh;
+  min-height: var(--app-height, 100vh);
+  width: 100%;
+  max-width: 100vw;
   overflow: hidden;
   padding: 24px;
 }
@@ -520,7 +468,7 @@ a {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr) 360px;
   gap: 18px;
-  height: calc(100vh - 48px);
+  height: calc(var(--app-height, 100vh) - 48px);
   min-height: 0;
 }
 
@@ -537,6 +485,7 @@ a {
 
 .panel--sidebar {
   animation-delay: 0.02s;
+  overflow: auto;
 }
 
 .panel--chat {
@@ -557,8 +506,97 @@ a {
   gap: 18px;
 }
 
-.panel--sidebar {
+.steam-drawer-toggle {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 33;
+  display: grid;
+  gap: 2px;
+  border: 0;
+  border-radius: 22px;
+  padding: 12px 18px;
+  background: linear-gradient(135deg, #3d7eff, #5b8cff);
+  color: #fff;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 18px 34px rgba(61, 126, 255, 0.28);
+}
+
+.steam-drawer-toggle span {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.78;
+}
+
+.steam-drawer-toggle strong {
+  font-size: 15px;
+}
+
+.steam-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 34;
+  background: rgba(10, 22, 40, 0.22);
+  backdrop-filter: blur(8px);
+}
+
+.device-desktop .steam-drawer-backdrop {
+  display: none;
+}
+
+.steam-drawer {
+  position: fixed;
+  z-index: 35;
+  top: 24px;
+  right: 24px;
+  bottom: 24px;
+  width: min(380px, calc(100vw - 48px));
+  padding: 20px;
+  border-radius: 34px;
+  background: rgba(247, 251, 255, 0.92);
+  backdrop-filter: blur(26px);
+  border: 1px solid rgba(255, 255, 255, 0.56);
+  box-shadow: 0 28px 70px rgba(13, 42, 78, 0.18);
+  transform: translateX(calc(100% + 48px));
+  transition: transform 0.24s ease;
   overflow: auto;
+}
+
+.steam-drawer--open {
+  transform: translateX(0);
+}
+
+.steam-drawer__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.steam-drawer .eyebrow {
+  margin: 0 0 6px;
+  color: rgba(35, 56, 102, 0.64);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.steam-drawer h2 {
+  margin: 0;
+  color: #102542;
+  font-size: 24px;
+}
+
+.steam-drawer__close {
+  border: 0;
+  border-radius: 16px;
+  padding: 10px 14px;
+  background: rgba(235, 241, 251, 0.88);
+  color: #274062;
+  cursor: pointer;
 }
 
 .floating-error {
@@ -623,6 +661,524 @@ a {
 
   .panel--chat {
     min-height: 60vh;
+  }
+}
+
+#app.device-tablet {
+  min-height: var(--app-height, 100vh);
+  width: 100%;
+  max-width: 100vw;
+  overflow: hidden;
+  padding: 18px;
+}
+
+.device-tablet .shell {
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 16px;
+  height: calc(var(--app-height, 100vh) - 36px);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.device-tablet .panel {
+  padding: 20px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.device-tablet .panel--sidebar,
+.device-tablet .panel--chat {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.device-tablet .sidebar {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.device-tablet .profile-list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.device-tablet .chat-pane {
+  min-width: 0;
+  height: 100%;
+}
+
+.device-tablet .message-list {
+  min-height: 0;
+}
+
+.device-tablet .steam-drawer-toggle {
+  right: 18px;
+  bottom: calc(18px + env(safe-area-inset-bottom));
+}
+
+.device-tablet .steam-drawer {
+  top: 18px;
+  right: 18px;
+  bottom: calc(18px + env(safe-area-inset-bottom));
+  width: min(420px, calc(100vw - 36px));
+}
+
+#app.device-mobile {
+  min-height: var(--app-height, 100vh);
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px 8px calc(8px + env(safe-area-inset-bottom));
+  overscroll-behavior-x: none;
+}
+
+.device-mobile .background {
+  display: none;
+}
+
+.device-mobile .shell {
+  grid-template-columns: 1fr;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  height: calc(var(--app-height, 100vh) - 16px - env(safe-area-inset-bottom));
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.device-mobile .panel {
+  padding: 10px;
+  border-radius: 22px;
+  min-height: auto;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  box-shadow: 0 16px 36px rgba(13, 42, 78, 0.1);
+}
+
+.device-mobile .panel--sidebar,
+.device-mobile .panel--steam {
+  overflow: hidden;
+}
+
+.device-mobile .panel--chat {
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  overflow: hidden;
+}
+
+.device-mobile .steam-stack {
+  gap: 12px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.device-mobile .steam-drawer-toggle {
+  right: 12px;
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  border-radius: 18px;
+  padding: 10px 14px;
+}
+
+.device-mobile .steam-drawer {
+  top: 10px;
+  right: 10px;
+  bottom: calc(10px + env(safe-area-inset-bottom));
+  width: min(360px, calc(100vw - 20px));
+  padding: 16px;
+  border-radius: 28px;
+}
+
+.device-mobile .steam-drawer h2 {
+  font-size: 21px;
+}
+
+.device-mobile .floating-error {
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  max-width: none;
+}
+
+.device-mobile .floating-error--bottom,
+.device-mobile .floating-error--bottom-secondary {
+  top: auto;
+  bottom: calc(12px + env(safe-area-inset-bottom));
+}
+
+.device-mobile .floating-error--bottom-secondary {
+  bottom: calc(76px + env(safe-area-inset-bottom));
+}
+
+.device-mobile .sidebar {
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.device-mobile .sidebar__header {
+  align-items: center;
+  min-width: 0;
+}
+
+.device-mobile .sidebar h1,
+.device-mobile .chat-pane h2,
+.device-mobile .dialog h2 {
+  font-size: 18px;
+}
+
+.device-mobile .sidebar .eyebrow,
+.device-mobile .chat-pane .eyebrow {
+  display: none;
+}
+
+.device-mobile .glass-button,
+.device-mobile .danger-button,
+.device-mobile .primary-button,
+.device-mobile .secondary-button,
+.device-mobile .ghost-button,
+.device-mobile .refresh-button {
+  padding: 8px 10px;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.device-mobile .profile-list {
+  flex-direction: row;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.device-mobile .profile-list::-webkit-scrollbar {
+  display: none;
+}
+
+.device-mobile .profile-card {
+  flex: 0 0 100%;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding: 9px 12px;
+  border-radius: 16px;
+  box-shadow: 0 8px 18px rgba(18, 52, 89, 0.08);
+  scroll-snap-align: start;
+}
+
+.device-mobile .profile-card:hover {
+  transform: none;
+}
+
+.device-mobile .profile-card__top {
+  align-items: flex-start;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.device-mobile .profile-card__top strong,
+.device-mobile .profile-card p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-mobile .profile-card__badge {
+  flex: 0 0 auto;
+}
+
+.device-mobile .sidebar__footer {
+  display: none;
+}
+
+.device-mobile .profile-card p,
+.device-mobile .profile-card__meta {
+  display: none;
+}
+
+.device-mobile .chat-pane {
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.device-mobile .chat-pane__header {
+  gap: 8px;
+  min-width: 0;
+}
+
+.device-mobile .chat-pane__header > div {
+  min-width: 0;
+}
+
+.device-mobile .chat-pane h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-mobile .error-banner {
+  padding: 8px 10px;
+  border-radius: 14px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.device-mobile .knowledge-section,
+.device-mobile .knowledge-body,
+.device-mobile .knowledge-list,
+.device-mobile .knowledge-item,
+.device-mobile .knowledge-drop-zone {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.device-mobile .knowledge-section {
+  padding: 7px 10px;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.device-mobile .knowledge-header {
+  min-width: 0;
+  gap: 8px;
+  min-height: 26px;
+}
+
+.device-mobile .knowledge-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-mobile .knowledge-item__name {
+  min-width: 0;
+}
+
+.device-mobile .knowledge-item__tag,
+.device-mobile .knowledge-item__delete {
+  flex: 0 0 auto;
+}
+
+.device-mobile .message-list {
+  gap: 8px;
+  padding: 4px 2px 4px 0;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.device-mobile .message-bubble {
+  min-width: 0;
+  max-width: 94%;
+  padding: 11px 12px;
+  border-radius: 18px;
+}
+
+.device-mobile .message-body {
+  font-size: 14px;
+  line-height: 1.65;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.device-mobile .message-body * {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.device-mobile .message-body pre,
+.device-mobile .message-body code {
+  white-space: pre-wrap;
+}
+
+.device-mobile .message-body table {
+  display: block;
+  overflow-x: auto;
+}
+
+.device-mobile .message-label {
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+
+.device-mobile .loading-bubble {
+  padding: 13px 14px;
+  border-radius: 20px;
+}
+
+.device-mobile .composer {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  padding: 8px;
+  border-radius: 18px;
+  bottom: calc(8px + env(safe-area-inset-bottom));
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.device-mobile .composer__input {
+  min-height: 40px;
+  max-height: 96px;
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+
+.device-mobile .composer__button {
+  width: auto;
+  min-width: 72px;
+  height: 40px;
+  border-radius: 14px;
+  padding: 0 12px;
+}
+
+.device-mobile .overlay,
+.device-mobile .sheet-overlay {
+  place-items: end center;
+  padding: 0 10px calc(10px + env(safe-area-inset-bottom));
+}
+
+.device-mobile .dialog,
+.device-mobile .sheet {
+  width: 100%;
+  max-height: calc(var(--app-height, 100vh) - 20px);
+  overflow: auto;
+  padding: 22px 18px calc(18px + env(safe-area-inset-bottom));
+  border-radius: 28px 28px 0 0;
+}
+
+.device-mobile .dialog__header,
+.device-mobile .dialog__footer,
+.device-mobile .sheet__header,
+.device-mobile .sheet__footer {
+  align-items: flex-start;
+}
+
+.device-mobile .dialog__footer,
+.device-mobile .sheet__footer {
+  gap: 10px;
+}
+
+.device-mobile .dialog__footer .secondary-button,
+.device-mobile .dialog__footer .primary-button,
+.device-mobile .sheet__footer .secondary-button,
+.device-mobile .sheet__footer .primary-button {
+  flex: 1;
+}
+
+.device-mobile .sheet__body {
+  grid-template-columns: 1fr;
+  gap: 14px;
+  padding-right: 0;
+}
+
+.device-mobile .section,
+.device-mobile .card {
+  padding: 16px;
+  border-radius: 24px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.device-mobile .card__header {
+  margin-bottom: 14px;
+  min-width: 0;
+}
+
+.device-mobile .card h3 {
+  font-size: 19px;
+}
+
+.device-mobile .hero {
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.device-mobile .hero img {
+  width: 56px;
+  height: 56px;
+  border-radius: 18px;
+}
+
+.device-mobile .stats {
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.device-mobile .deal-item {
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+  border-radius: 18px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.device-mobile .deal-item img {
+  width: 72px;
+  height: 48px;
+  border-radius: 14px;
+}
+
+.device-mobile .deal-item__title,
+.device-mobile .deal-item__price {
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.device-mobile .game-card,
+.device-mobile .current-game,
+.device-mobile .stat {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.device-mobile .deal-item strong,
+.device-mobile .game-card strong,
+.device-mobile .hero strong,
+.device-mobile .current-game strong,
+.device-mobile .stat strong {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (max-width: 380px) {
+  .device-mobile .shell {
+    gap: 10px;
+  }
+}
+
+@media (max-width: 360px) {
+  .device-mobile .composer {
+    grid-template-columns: 1fr;
+  }
+
+  .device-mobile .composer__button {
+    width: 100%;
   }
 }
 </style>

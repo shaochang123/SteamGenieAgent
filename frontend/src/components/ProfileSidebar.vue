@@ -2,7 +2,7 @@
   <aside class="sidebar">
     <div class="sidebar__header">
       <div>
-        <p class="eyebrow">Steam MCP</p>
+        <p class="eyebrow">Steam Agent</p>
         <h1>Steam Desk</h1>
       </div>
       <button class="glass-button" type="button" @click="$emit('create-profile')">

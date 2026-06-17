@@ -1,53 +1,64 @@
-// ============================================================================
-// Steam Market & Price Intelligence Service
-// ============================================================================
-
 import type { MarketPrice, PriceHistoryEntry } from "../types.js";
-import { _getProxyAgent } from "./api.js";
-import * as https from "node:https";
-import * as http from "node:http";
+import { fetchSteamJson } from "./http.js";
 
-/** Fetch raw text via native https/http (compatible with HttpsProxyAgent). */
-async function _fetchText(url: string, timeout = 15000): Promise<string> {
-  const u = new URL(url);
-  const mod = u.protocol === "https:" ? https : http;
-  const agent = _getProxyAgent();
-  const headers: Record<string, string> = { Accept: "*/*" };
-
-  return new Promise((resolve, reject) => {
-    const req = mod.request({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      agent: agent || undefined,
-      headers,
-      timeout,
-    }, (res) => {
-      let data = "";
-      res.on("data", (chunk: Buffer) => data += chunk.toString());
-      res.on("end", () => {
-        if (res.statusCode && res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}`));
-        } else {
-          resolve(data);
-        }
-      });
-    });
-    req.on("error", (e: Error) => reject(new Error(`fetch failed: ${e.message}`)));
-    req.on("timeout", () => { req.destroy(); reject(new Error("fetch timeout")); });
-    req.end();
-  });
-}
-
-/** Cache TTLs in milliseconds */
 const CACHE_TTL = {
   PRICE: 60_000,          // 1 minute for current prices
   HISTORY: 300_000,       // 5 minutes for price history
   SEARCH: 120_000,        // 2 minutes for search results
 };
 
+const STEAM_CURRENCY_CODES: Record<string, number> = {
+  USD: 1, GBP: 2, EUR: 3, CHF: 4, RUB: 5,
+  PLN: 6, BRL: 7, JPY: 8, SEK: 9, IDR: 10,
+  MYR: 11, PHP: 12, SGD: 13, THB: 14, VND: 15,
+  KRW: 16, TRY: 17, UAH: 18, MXN: 19, CAD: 20,
+  AUD: 21, NZD: 22, CNY: 23, INR: 24, CLP: 25,
+  PEN: 26, COP: 27, ZAR: 28, HKD: 29, TWD: 30,
+  SAR: 31, AED: 32, ARS: 34, ILS: 35, BYN: 36,
+  KZT: 37, KWD: 38, QAR: 39, CRC: 40, UYU: 41,
+  NOK: 162, ISK: 164,
+};
+
 interface CacheEntry<T> {
   data: T;
   timestamp: number;
+}
+
+interface MarketInventoryItem {
+  assetid: string;
+  classid: string;
+  instanceid: string;
+  amount: number;
+  marketHashName: string;
+  iconUrl: string;
+  tradable: boolean;
+  marketable: boolean;
+}
+
+interface FeaturedDeal {
+  appid: number;
+  name: string;
+  discountPercent: number;
+  originalPrice: number;
+  finalPrice: number;
+  currency: string;
+  largeCapsuleImage: string;
+}
+
+function uniqueTerms(query: string): string[] {
+  const cleaned = query
+    .replace(/[《》“”"]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const withoutReviewWords = cleaned
+    .replace(/\b(reviews?|ratings?|scores?)\b/gi, " ")
+    .replace(/(评价|评测|评分|怎么样|咋样)/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const withoutLeadingArticle = withoutReviewWords.replace(/^(the|a|an)\s+/i, "");
+  return Array.from(
+    new Set([cleaned, withoutReviewWords, withoutLeadingArticle].filter(Boolean))
+  );
 }
 
 export class SteamMarketService {
@@ -70,9 +81,6 @@ export class SteamMarketService {
     this.cache.set(key, { data, timestamp: Date.now() });
   }
 
-  // ---- Item Prices ----
-
-  /** Get Steam Market price for an item by market hash name */
   async getItemPrice(
     marketHashName: string,
     appid = 730
@@ -81,16 +89,20 @@ export class SteamMarketService {
     const cached = this.cacheGet<MarketPrice>(cacheKey, CACHE_TTL.PRICE);
     if (cached) return cached;
 
-    const url = `https://steamcommunity.com/market/priceoverview/?appid=${appid}&currency=${this.getCurrencyCode()}&market_hash_name=${encodeURIComponent(marketHashName)}`;
+    const params = new URLSearchParams({
+      appid: String(appid),
+      currency: this.getCurrencyCode(),
+      market_hash_name: marketHashName,
+    });
+    const url = `https://steamcommunity.com/market/priceoverview/?${params.toString()}`;
 
     try {
-      const raw = await _fetchText(url);
-      const data = JSON.parse(raw) as {
+      const data = await fetchSteamJson<{
         success: boolean;
         lowest_price?: string;
         median_price?: string;
         volume?: string;
-      };
+      }>(url);
 
       if (!data.success) return null;
 
@@ -109,7 +121,6 @@ export class SteamMarketService {
     }
   }
 
-  /** Get market prices for multiple items (batched - limited by API) */
   async getMultipleItemPrices(
     items: Array<{ name: string; appid: number }>
   ): Promise<Map<string, MarketPrice>> {
@@ -124,22 +135,18 @@ export class SteamMarketService {
     return results;
   }
 
-  // ---- CS2 / Dota2 Inventory ----
-
-  /** Get inventory items for CS2 (appid 730) */
   async getInventory(
     steamId: string,
     appid: number,
     contextId = "2"
-  ): Promise<Array<{ assetid: string; classid: string; instanceid: string; amount: number; marketHashName: string; iconUrl: string; tradable: boolean; marketable: boolean }>> {
+  ): Promise<MarketInventoryItem[]> {
     // Ensure Steam ID is 64-bit
     const id64 = steamId.startsWith("7656") ? steamId : `7656119${BigInt(steamId) + 7960265728n}`;
 
     const url = `https://steamcommunity.com/inventory/${id64}/${appid}/${contextId}?l=english&count=5000`;
 
     try {
-      const raw = await _fetchText(url);
-      const data = JSON.parse(raw) as {
+      const data = await fetchSteamJson<{
         success: boolean;
         assets?: Array<{
           assetid: string;
@@ -155,7 +162,7 @@ export class SteamMarketService {
           tradable: number;
           marketable: number;
         }>;
-      };
+      }>(url);
 
       if (!data.success || !data.assets || !data.descriptions) return [];
 
@@ -185,9 +192,6 @@ export class SteamMarketService {
     }
   }
 
-  // ---- Price History ----
-
-  /** Get price history for a game (via SteamDB-like community data) */
   async getPriceHistory(
     appid: number
   ): Promise<PriceHistoryEntry[]> {
@@ -197,8 +201,7 @@ export class SteamMarketService {
 
     try {
       const storeUrl = `https://store.steampowered.com/api/appdetails?appids=${appid}&cc=CN&filters=price_overview`;
-      const raw = await _fetchText(storeUrl);
-      const data = JSON.parse(raw) as Record<
+      const data = await fetchSteamJson<Record<
         string,
         {
           success: boolean;
@@ -211,7 +214,7 @@ export class SteamMarketService {
             };
           };
         }
-      >;
+      >>(storeUrl);
 
       const entry = data[String(appid)];
       if (!entry?.success || !entry.data.price_overview) return [];
@@ -241,76 +244,63 @@ export class SteamMarketService {
     }
   }
 
-  // ---- Store Search ----
-
-  /** Search the Steam store */
   async searchStore(
     query: string,
     country = "CN",
     language = "zh-CN"
   ): Promise<Array<{ appid: number; name: string }>> {
-    const cacheKey = `search:${query}:${country}`;
+    const cacheKey = `search:${query}:${country}:${language}`;
     const cached = this.cacheGet<Array<{ appid: number; name: string }>>(
       cacheKey,
       CACHE_TTL.SEARCH
     );
     if (cached) return cached;
 
-    const url = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(query)}&cc=${country}&l=${language}`;
+    for (const term of uniqueTerms(query)) {
+      const results = await this.fetchStoreSearch(term, country, language);
+      if (results.length > 0) {
+        this.cacheSet(cacheKey, results);
+        return results;
+      }
+    }
+    return [];
+  }
+
+  private async fetchStoreSearch(
+    query: string,
+    country: string,
+    language: string
+  ): Promise<Array<{ appid: number; name: string }>> {
+    const params = new URLSearchParams({ term: query, cc: country, l: language });
+    const url = `https://store.steampowered.com/api/storesearch/?${params.toString()}`;
 
     try {
-      const raw = await _fetchText(url);
-      const data = JSON.parse(raw) as {
-        success: boolean;
-        total: number;
-        items: Array<{ id: number; name: string; tiny_image: string }>;
-      };
-      if (!data.success) return [];
-      const results = data.items.map((item) => ({
-        appid: item.id,
-        name: item.name,
-      }));
-      this.cacheSet(cacheKey, results);
-      return results;
+      const data = await fetchSteamJson<{
+        success?: boolean;
+        total?: number;
+        items?: Array<{ id: number; name: string; type?: string }>;
+      }>(url);
+      if (data.success === false || !Array.isArray(data.items)) return [];
+      return data.items
+        .filter((item) => item.id && item.name && (!item.type || item.type === "app"))
+        .map((item) => ({ appid: item.id, name: item.name }));
     } catch {
       return [];
     }
   }
 
-  /** Get featured deals */
   async getFeaturedDeals(
     country = "CN",
     language = "zh-CN"
-  ): Promise<
-    Array<{
-      appid: number;
-      name: string;
-      discountPercent: number;
-      originalPrice: number;
-      finalPrice: number;
-      currency: string;
-      largeCapsuleImage: string;
-    }>
-  > {
+  ): Promise<FeaturedDeal[]> {
     const cacheKey = `featured:${country}`;
-    const cached = this.cacheGet<
-      Array<{
-        appid: number;
-        name: string;
-        discountPercent: number;
-        originalPrice: number;
-        finalPrice: number;
-        currency: string;
-        largeCapsuleImage: string;
-      }>
-    >(cacheKey, CACHE_TTL.SEARCH);
+    const cached = this.cacheGet<FeaturedDeal[]>(cacheKey, CACHE_TTL.SEARCH);
     if (cached) return cached;
 
     const url = `https://store.steampowered.com/api/featuredcategories/?cc=${country}&l=${language}`;
 
     try {
-      const raw = await _fetchText(url);
-      const data = JSON.parse(raw) as {
+      const data = await fetchSteamJson<{
         specials?: {
           items: Array<{
             id: number;
@@ -322,7 +312,7 @@ export class SteamMarketService {
             large_capsule_image: string;
           }>;
         };
-      };
+      }>(url);
 
       const deals = (data.specials?.items || []).map((item) => ({
         appid: item.id,
@@ -340,19 +330,7 @@ export class SteamMarketService {
     }
   }
 
-  /** Convert currency code to Steam market param */
   private getCurrencyCode(): string {
-    const map: Record<string, number> = {
-      USD: 1, GBP: 2, EUR: 3, CHF: 4, RUB: 5,
-      PLN: 6, BRL: 7, JPY: 8, SEK: 9, IDR: 10,
-      MYR: 11, PHP: 12, SGD: 13, THB: 14, VND: 15,
-      KRW: 16, TRY: 17, UAH: 18, MXN: 19, CAD: 20,
-      AUD: 21, NZD: 22, CNY: 23, INR: 24, CLP: 25,
-      PEN: 26, COP: 27, ZAR: 28, HKD: 29, TWD: 30,
-      SAR: 31, AED: 32, ARS: 34, ILS: 35, BYN: 36,
-      KZT: 37, KWD: 38, QAR: 39, CRC: 40, UYU: 41,
-      NOK: 162, ISK: 164,
-    };
-    return String(map[this.currency] || 23); // default CNY
+    return String(STEAM_CURRENCY_CODES[this.currency] || STEAM_CURRENCY_CODES.CNY);
   }
 }

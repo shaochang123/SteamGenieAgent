@@ -22,8 +22,17 @@ export const appStore = Vue.observable({
   profiles: [],
   selectedProfileId: '',
   selectedProfile: null,
-  messages: [],
-  streamingContent: '',
+  chatSessions: {},
+  device: {
+    mode: 'desktop',
+    isTouch: false,
+    width: 0,
+    height: 0,
+  },
+  ui: {
+    steamDrawerOpen: false,
+    steamDrawerTouched: false,
+  },
   steamOverview: createEmptyOverview(),
   steamDeals: createEmptyDeals(),
   dialogs: {
@@ -32,15 +41,12 @@ export const appStore = Vue.observable({
   },
   loading: {
     profiles: false,
-    conversation: false,
-    sending: false,
     steam: false,
     createProfile: false,
     saveSettings: false,
   },
   error: {
     profiles: '',
-    chat: '',
     steam: '',
     createProfile: '',
     settings: '',

@@ -1,0 +1,8 @@
+{
+  "name": "tModLoader",
+  "description": "Dig, Fight, and Build your way through the world of player-created mods on Terraria with tModLoader - this DLC makes modding Terraria a reality!",
+  "requirements": "<strong>Minimum:</strong><br><ul class=\"bb_ul\"><li><strong>OS *:</strong> Windows 7 x64, 8/8.1 x64, 10, 11<br></li><li><strong>Processor:</strong> 2.0 Ghz<br></li><li><strong>Memory:</strong> 6 GB RAM<br></li><li><strong>Graphics:</strong> FNA Requirements: <br></li><li><strong>DirectX:</strong> Version 11<br></li><li><strong>Storage:</strong> 500 MB available space<br></li><li><strong>Additional Notes:</strong> tModLoader relies on NET 8 runtime. NET 8 requirements: . Additional Requirements may vary with installed Workshop Items</li></ul>",
+  "comment1": "",
+  "comment2": "",
+  "comment3": ""
+}

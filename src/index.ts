@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-// ============================================================================
-// Steam Genie MCP Server
-// AI-powered Steam game management via Model Context Protocol
-// ============================================================================
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -15,7 +11,6 @@ import { registerMarketTools } from "./tools/market.js";
 import { registerLocalTools } from "./tools/local.js";
 import { registerSocialTools } from "./tools/social.js";
 
-// ---- Parse CLI arguments ----
 function parseArgs(): {
   apiKey: string;
   steamId: string;
@@ -31,51 +26,42 @@ function parseArgs(): {
     if (args[idx].includes("=")) return args[idx].split("=")[1];
     return args[idx + 1] || "";
   };
+  const readOption = (envName: string, names: string[], fallback = ""): string =>
+    process.env[envName] || names.map(getArg).find(Boolean) || fallback;
 
   return {
-    apiKey:
-      process.env.STEAM_API_KEY || getArg("api-key") || getArg("apiKey") || "",
-    steamId:
-      process.env.STEAM_ID || getArg("steam-id") || getArg("steamId") || "",
-    steamPath:
-      process.env.STEAM_PATH ||
-      getArg("steam-path") ||
-      getArg("steamPath") ||
-      detectSteamPath(),
-    currency: process.env.STEAM_CURRENCY || getArg("currency") || "CNY",
+    apiKey: readOption("STEAM_API_KEY", ["api-key", "apiKey"]),
+    steamId: readOption("STEAM_ID", ["steam-id", "steamId"]),
+    steamPath: readOption("STEAM_PATH", ["steam-path", "steamPath"]) || detectSteamPath(),
+    currency: readOption("STEAM_CURRENCY", ["currency"], "CNY"),
   };
 }
 
-// ---- Main ----
 async function main() {
   const config = parseArgs();
 
-  // Initialize services
   const api = new SteamApiClient(config.apiKey, config.steamId);
   const market = new SteamMarketService(config.currency);
 
-  // Create MCP server
   const server = new McpServer({
     name: "steam-genie-mcp",
     version: "1.0.0",
   });
 
-  // Register all tool groups
-  registerLibraryTools(server, api, market, config.steamPath);
-  registerInventoryTools(server, api, market);
+  registerLibraryTools(server, api, config.steamPath);
+  registerInventoryTools(server, market);
   registerMarketTools(server, api, market);
   registerLocalTools(server, config.steamPath);
   registerSocialTools(server, api);
 
-  // Start the stdio transport
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Log startup info to stderr (won't interfere with MCP protocol on stdout)
-  console.error("🧞‍♂️ Steam Genie MCP Server started");
+  // Log startup info to stderr so stdout remains valid MCP protocol traffic.
+  console.error("Steam Genie MCP Server started");
   console.error(`   Steam Path: ${config.steamPath}`);
-  console.error(`   API Key: ${config.apiKey ? "✓ configured" : "✗ not set (some features limited)"}`);
-  console.error(`   Steam ID: ${config.steamId || "✗ not set"}`);
+  console.error(`   API Key: ${config.apiKey ? "configured" : "not set (some features limited)"}`);
+  console.error(`   Steam ID: ${config.steamId || "not set"}`);
   console.error(`   Currency: ${config.currency}`);
 }
 

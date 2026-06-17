@@ -1,7 +1,7 @@
 {
   "name": "Another Earth: Gaming Grid",
-  "description": "Another Earth: Gaming Grid是一个令人愉悦的虚拟世界，让玩家有机会成为创造者，给予玩家能力与工具去扩展这个世界。在不断发展的世界中为其他玩家创造属于自己的故事和有意义的体验",
-  "requirements": "<strong>最低配置:</strong><br><ul class=\"bb_ul\"><li>需要 64 位处理器和操作系统<br></li><li><strong>操作系统:</strong> Windows 10 64-bit<br></li><li><strong>处理器:</strong> Intel Core i3-12100 (4 Core / Threads 8)<br></li><li><strong>内存:</strong> 8 GB RAM<br></li><li><strong>显卡:</strong> NVIDIA GTX 1060TI<br></li><li><strong>DirectX 版本:</strong> 12<br></li><li><strong>网络:</strong> 宽带互联网连接<br></li><li><strong>存储空间:</strong> 需要 30 GB 可用空间</li></ul>",
+  "description": "Another Earth: Gaming Grid is a delightful virtual world, empowering players to be creators with the tools to expand the universe. In this ever-evolving world, our goal is for players to craft their own stories and meaningful experiences for others.",
+  "requirements": "<strong>Minimum:</strong><br><ul class=\"bb_ul\"><li>Requires a 64-bit processor and operating system<br></li><li><strong>OS:</strong> Windows 10 64-bit<br></li><li><strong>Processor:</strong> Intel Core i3-12100 (4 Core / Threads 8)<br></li><li><strong>Memory:</strong> 8 GB RAM<br></li><li><strong>Graphics:</strong> NVIDIA GTX 1060TI<br></li><li><strong>DirectX:</strong> Version 12<br></li><li><strong>Network:</strong> Broadband Internet connection<br></li><li><strong>Storage:</strong> 30 GB available space</li></ul>",
   "comment1": "",
   "comment2": "",
   "comment3": ""
