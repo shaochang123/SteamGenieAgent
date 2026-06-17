@@ -23,6 +23,16 @@ export const appStore = Vue.observable({
   selectedProfileId: '',
   selectedProfile: null,
   chatSessions: {},
+  device: {
+    mode: 'desktop',
+    isTouch: false,
+    width: 0,
+    height: 0,
+  },
+  ui: {
+    steamDrawerOpen: false,
+    steamDrawerTouched: false,
+  },
   steamOverview: createEmptyOverview(),
   steamDeals: createEmptyDeals(),
   dialogs: {

@@ -1,7 +1,16 @@
 import axios from 'axios'
 
-const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000'
 const OLLAMA_PORTS = new Set(['11343', '11434'])
+const FASTAPI_PORT = '8000'
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
+
+function inferredApiBaseUrl() {
+  if (typeof window === 'undefined' || !window.location?.hostname) {
+    return 'http://127.0.0.1:8000'
+  }
+
+  return `${window.location.protocol}//${window.location.hostname}:${FASTAPI_PORT}`
+}
 
 function isOllamaUrl(value) {
   try {
@@ -12,16 +21,37 @@ function isOllamaUrl(value) {
   }
 }
 
+function isLoopbackApiUrl(value) {
+  try {
+    return LOOPBACK_HOSTS.has(new URL(value).hostname)
+  } catch {
+    return false
+  }
+}
+
+function isPageLoadedFromLanHost() {
+  return typeof window !== 'undefined' &&
+    window.location?.hostname &&
+    !LOOPBACK_HOSTS.has(window.location.hostname)
+}
+
 function apiBaseUrl() {
-  const configured = (process.env.VUE_APP_API_BASE_URL || DEFAULT_API_BASE_URL).replace(/\/+$/, '')
+  const fallback = inferredApiBaseUrl()
+  const configured = (process.env.VUE_APP_API_BASE_URL || fallback).replace(/\/+$/, '')
   if (!isOllamaUrl(configured)) {
+    if (isPageLoadedFromLanHost() && isLoopbackApiUrl(configured)) {
+      console.warn(
+        `VUE_APP_API_BASE_URL points to local loopback (${configured}); falling back to FastAPI ${fallback}.`
+      )
+      return fallback
+    }
     return configured
   }
 
   console.warn(
-    `VUE_APP_API_BASE_URL points to Ollama (${configured}); falling back to FastAPI ${DEFAULT_API_BASE_URL}.`
+    `VUE_APP_API_BASE_URL points to Ollama (${configured}); falling back to FastAPI ${fallback}.`
   )
-  return DEFAULT_API_BASE_URL
+  return fallback
 }
 
 const API_BASE_URL = apiBaseUrl()
@@ -32,6 +62,10 @@ const api = axios.create({
 })
 
 export function normalizeError(error) {
+  if (error?.message === 'Network Error') {
+    return `无法连接后端服务：${API_BASE_URL}`
+  }
+
   return (
     error?.response?.data?.detail ||
     error?.response?.data?.message ||
