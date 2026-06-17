@@ -63,6 +63,12 @@ async def get_or_create_mcp_client(profile_id: str) -> PersistentMCPClientManage
 
     manager = _mcp_pool.get(profile_id)
     if manager is not None:
+        try:
+            await manager.ensure_healthy()
+        except Exception:
+            logger.warning("Failed to refresh cached MCP client for profile %s", profile_id, exc_info=True)
+            await invalidate_mcp_client(profile_id)
+            return None
         return manager
 
     logger.info("Starting MCP client for profile %s...", profile_id)

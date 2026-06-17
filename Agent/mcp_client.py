@@ -12,6 +12,28 @@ _SCHEMA_REJECTED_KEYS = frozenset({"$schema", "additionalProperties", "title"})
 logger = logging.getLogger("MCP")
 
 
+def _server_entry_path() -> Path:
+    """Resolve the built JavaScript server or TypeScript dev entrypoint."""
+    project_dir = Path(__file__).resolve().parent.parent
+    src_dir = project_dir / "src"
+    dist_js = project_dir / "dist" / "index.js"
+    if dist_js.exists():
+        return dist_js
+    src_ts = src_dir / "index.ts"
+    if src_ts.exists():
+        return src_ts
+    raise FileNotFoundError(
+        f"MCP server not found at {dist_js} or {src_ts}. "
+        "Run 'npm run build' in the project root first."
+    )
+
+
+def _server_signature() -> tuple[str, int]:
+    """Return a stable signature that changes when the MCP entry file changes."""
+    server_path = _server_entry_path()
+    return str(server_path), server_path.stat().st_mtime_ns
+
+
 def _strip_schema_meta(schema: dict[str, Any]) -> dict[str, Any]:
     """Remove JSON Schema keys that are not accepted by all LLM providers."""
     return {key: value for key, value in schema.items() if key not in _SCHEMA_REJECTED_KEYS}
@@ -70,18 +92,7 @@ class MCPClientManager:
 
     def _server_path(self) -> Path:
         """Resolve the built JavaScript server or TypeScript dev entrypoint."""
-        project_dir = Path(__file__).resolve().parent.parent
-        src_dir = project_dir / "src"
-        dist_js = project_dir / "dist" / "index.js"
-        if dist_js.exists():
-            return dist_js
-        src_ts = src_dir / "index.ts"
-        if src_ts.exists():
-            return src_ts
-        raise FileNotFoundError(
-            f"MCP server not found at {dist_js} or {src_ts}. "
-            "Run 'npm run build' in the project root first."
-        )
+        return _server_entry_path()
 
     def _build_env(self) -> dict[str, str]:
         """Build the MCP subprocess environment from profile Steam settings."""
@@ -193,19 +204,30 @@ class PersistentMCPClientManager:
         """Create a lazy persistent manager for one profile."""
         self._profile = profile
         self._manager: MCPClientManager | None = None
+        self._signature: tuple[str, int] | None = None
 
     async def start(self) -> list[Any]:
-        """Start the subprocess once or return already loaded tools."""
-        if self._manager is not None:
+        """Start the subprocess once or restart it when the MCP build changes."""
+        signature = _server_signature()
+        if self._manager is not None and self._signature == signature:
             return self._manager.tools
+        if self._manager is not None:
+            logger.info("MCP build changed; restarting subprocess...")
+            await self.stop()
         self._manager = MCPClientManager(self._profile)
-        return await self._manager.start()
+        self._signature = signature
+        try:
+            return await self._manager.start()
+        except Exception:
+            self._signature = None
+            raise
 
     async def stop(self) -> None:
         """Stop and forget the cached MCP subprocess manager."""
         if self._manager is not None:
             await self._manager.stop()
             self._manager = None
+        self._signature = None
 
     async def health_check(self) -> bool:
         """Return True if the underlying MCP subprocess is still alive."""
@@ -214,7 +236,10 @@ class PersistentMCPClientManager:
         return await self._manager.ping()
 
     async def ensure_healthy(self) -> None:
-        """Restart the MCP subprocess if health check fails."""
+        """Restart the MCP subprocess if health check fails or build changed."""
+        if self._manager is not None and self._signature != _server_signature():
+            logger.info("MCP build changed; restarting subprocess...")
+            await self.stop()
         if not await self.health_check():
             logger.warning("MCP health check failed, restarting subprocess...")
             await self.stop()
